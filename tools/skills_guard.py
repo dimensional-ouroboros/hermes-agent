@@ -21,19 +21,11 @@ Usage:
     if not allowed:
         print(format_scan_report(result))
 
-Known limitation — programmatic writes (out of scope for this static pass):
-the agent-config persistence tiers score shell write mechanics
-(">>" redirection, "sed -i") and imperative modification prose only.
-Language write APIs in bundled scripts — Python open(..., 'w'/'a'),
-pathlib.Path.write_text(), os.replace(), shutil.copy*, and Node
-fs.writeFileSync()/appendFile() — aimed at agent-config files surface
-only the low-severity *_ref finding, never a scored persistence tier.
-Static regexes cannot reliably tie such a call to the config-file
-destination (paths may be built dynamically) without executing the
-skill, so language-API persistence is left to runtime gates (install
-confirmation, sandboxing). If coverage is added later, it belongs as a
-fourth "mechanical" tier next to agent_config_mod_shell, requiring the
-config-file name as a literal argument at the call site.
+The artifact-policy pass detects common executable temporary-file and path
+writers and requires lifecycle metadata when it finds them. It remains a
+static check: dynamically constructed paths, custom allocators, and writes
+hidden behind imported functions require runtime sandboxing and install-time
+review. It does not claim to be a complete local filesystem sandbox.
 """
 
 import re
@@ -46,7 +38,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v2"
+SCANNER_VERSION = "skills-guard-v4"
 
 
 
@@ -106,6 +98,8 @@ class ScanResult:
     scanned_at: str = ""
     summary: str = ""
     scan_provenance: dict = field(default_factory=dict)
+    policy_findings: List[Finding] = field(default_factory=list)
+    artifact_policy: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -822,6 +816,228 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     return findings
 
 
+_ARTIFACT_POLICY_LANGUAGES = frozenset({
+    "", "bash", "shell", "sh", "zsh", "fish", "python", "py",
+    "javascript", "js", "typescript", "ts", "powershell", "pwsh",
+})
+_ARTIFACT_POLICY_REJECTED_MARKERS = (
+    "anti-pattern",
+    "do not run",
+    "don't run",
+    "legacy example",
+    "never use",
+    "not recommended",
+    "rejected",
+    "wrong:",
+)
+
+
+def _iter_artifact_policy_lines(file_path: Path):
+    """Yield executable-looking lines from one skill file."""
+    if file_path.suffix.lower() == ".md" or file_path.name == "SKILL.md":
+        in_fence = False
+        executable = False
+        rejected = False
+        context: list[str] = []
+        try:
+            lines = file_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return
+        for line_number, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                if not in_fence:
+                    language = stripped[3:].strip().lower().split()[0] if stripped[3:].strip() else ""
+                    executable = language in _ARTIFACT_POLICY_LANGUAGES
+                    rejected = any(
+                        marker in " ".join(context[-3:]).lower()
+                        for marker in _ARTIFACT_POLICY_REJECTED_MARKERS
+                    )
+                    in_fence = True
+                else:
+                    in_fence = False
+                    executable = False
+                    rejected = False
+                context.append(line)
+                continue
+            context.append(line)
+            if in_fence and executable and not rejected:
+                yield line_number, line
+        return
+    try:
+        lines = file_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return
+    for line_number, line in enumerate(lines, start=1):
+        if line.lstrip().startswith(("#", "//", "/*", "*")):
+            continue
+        yield line_number, line
+
+
+def scan_artifact_policy(skill_path: Path, ignore=None) -> List[Finding]:
+    """Find executable skill guidance that bypasses managed artifacts."""
+    if skill_path.is_file():
+        files = [(skill_path, skill_path.name)]
+    elif skill_path.is_dir():
+        files = [
+            (path, str(path.relative_to(skill_path)))
+            for path in skill_path.rglob("*")
+            if path.is_file()
+        ]
+    else:
+        return []
+
+    findings: list[Finding] = []
+    seen: set[tuple[str, int]] = set()
+    for file_path, relative_path in files:
+        if ignore is not None and ignore(relative_path):
+            continue
+        for line_number, line in _iter_artifact_policy_lines(file_path):
+            lowered = line.lower()
+            patterns = []
+            if re.search(r"\bmktemp\s+-d\b|\bmkdtemp\s*\(", line):
+                patterns.append(("artifact_mktemp", "uses an unmanaged temporary-directory allocator"))
+            if re.search(r"\b(?:temporarydirectory|namedtemporaryfile)\s*\(", lowered):
+                if "dir=" not in lowered or "hermes_operation" not in lowered:
+                    patterns.append(("artifact_temp_api", "uses a temporary-file API without an owned root"))
+            if re.search(
+                r"\bopen\s*\([^\n]*(?:mode\s*=\s*)?[\"'](?:a|w|x)[b+]*[\"']"
+                r"|\bos\.replace\s*\(|\bshutil\.copy(?:2)?\s*\(",
+                lowered,
+            ):
+                patterns.append(("artifact_file_writer", "writes or replaces files outside an owned artifact operation"))
+            if re.search(r"/(?:tmp|run/user)/[A-Za-z0-9_.-]+", line):
+                patterns.append(("artifact_tmp_path", "hardcodes an operating-system scratch path"))
+            if re.search(r"\brm\s+-r(?:f|F)?\b|\bshutil\.rmtree\s*\(", line):
+                patterns.append(("artifact_recursive_delete", "uses unbounded recursive artifact deletion"))
+            if re.search(r"\bgit\s+worktree\s+add\b[^\n]*/(?:tmp|run/user)/", line):
+                patterns.append(("artifact_unmanaged_worktree", "creates a worktree outside the managed worktree lifecycle"))
+            for pattern_id, description in patterns:
+                key = (pattern_id, line_number)
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(Finding(
+                    pattern_id=pattern_id,
+                    severity="medium",
+                    category="artifact_lifecycle",
+                    file=relative_path,
+                    line=line_number,
+                    match=f"artifact policy violation: {pattern_id}",
+                    description=description,
+                ))
+    return findings
+
+
+def _load_artifact_policy(skill_path: Path) -> tuple[dict, str | None]:
+    """Load and minimally validate artifact policy frontmatter."""
+    manifest = skill_path / "SKILL.md" if skill_path.is_dir() else skill_path
+    if manifest.name != "SKILL.md" or not manifest.is_file():
+        return {}, None
+    try:
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return {}, "artifact_policy_unreadable"
+    if not lines or lines[0].strip() != "---":
+        return {}, None
+    try:
+        end = next(index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---")
+    except StopIteration:
+        return {}, "artifact_policy_frontmatter_invalid"
+    try:
+        import yaml
+
+        frontmatter = yaml.safe_load("\n".join(lines[1:end])) or {}
+    except Exception:
+        return {}, "artifact_policy_frontmatter_invalid"
+    if not isinstance(frontmatter, dict):
+        return {}, "artifact_policy_frontmatter_invalid"
+    policy = frontmatter.get("artifact_policy")
+    if policy is None:
+        return {}, None
+    if not isinstance(policy, dict):
+        return {}, "artifact_policy_invalid"
+    return policy, None
+
+
+def _has_programmatic_writer_guidance(skill_path: Path, ignore=None) -> bool:
+    """Return whether a skill contains a likely file-writing API."""
+    if skill_path.is_file():
+        files = [skill_path]
+    elif skill_path.is_dir():
+        files = [path for path in skill_path.rglob("*") if path.is_file()]
+    else:
+        return False
+    writer = re.compile(
+        r"\b(?:write_file|write_text|write_bytes|mkstemp|mkdtemp|"
+        r"NamedTemporaryFile|TemporaryDirectory)\b"
+        r"|\bopen\s*\([^\n]*(?:mode\s*=\s*)?[\"'](?:a|w|x)[b+]*[\"']"
+        r"|\bos\.replace\s*\(|\bshutil\.copy(?:2)?\s*\("
+    )
+    for file_path in files:
+        relative_path = (
+            str(file_path.relative_to(skill_path)) if skill_path.is_dir() else file_path.name
+        )
+        if ignore is not None and ignore(relative_path):
+            continue
+        for _line_number, line in _iter_artifact_policy_lines(file_path):
+            if writer.search(line):
+                return True
+    return False
+
+
+def _artifact_policy_metadata_findings(
+    skill_path: Path,
+    *,
+    ignore=None,
+) -> tuple[List[Finding], dict]:
+    """Validate declared lifecycle metadata when a skill writes files."""
+    if not _has_programmatic_writer_guidance(skill_path, ignore=ignore):
+        return [], _load_artifact_policy(skill_path)[0]
+    policy, error = _load_artifact_policy(skill_path)
+    if error:
+        return [Finding(
+            pattern_id=error,
+            severity="medium",
+            category="artifact_lifecycle",
+            file="SKILL.md",
+            line=1,
+            match=error,
+            description="skill file-writing guidance has invalid artifact policy metadata",
+        )], policy
+    if not policy:
+        return [Finding(
+            pattern_id="artifact_policy_missing",
+            severity="medium",
+            category="artifact_lifecycle",
+            file="SKILL.md",
+            line=1,
+            match="artifact_policy is missing",
+            description="file-writing guidance must declare artifact lifecycle ownership",
+        )], policy
+    required = {
+        "kinds": list,
+        "cleanup": str,
+        "persistent_outputs": str,
+        "external_state": str,
+    }
+    invalid = [
+        key for key, expected_type in required.items()
+        if not isinstance(policy.get(key), expected_type)
+    ]
+    if invalid:
+        return [Finding(
+            pattern_id="artifact_policy_invalid",
+            severity="medium",
+            category="artifact_lifecycle",
+            file="SKILL.md",
+            line=1,
+            match=", ".join(invalid),
+            description="artifact policy must declare kinds, cleanup, persistent_outputs, and external_state",
+        )], policy
+    return [], policy
+
+
 def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
     """
     Scan all files in a skill directory for security threats.
@@ -850,6 +1066,8 @@ def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
     trust_level = _resolve_trust_level(source)
 
     all_findings: List[Finding] = []
+    policy_findings: List[Finding] = []
+    artifact_policy: dict = {}
 
     if skill_path.is_dir():
         ignore = _load_skill_ignore(skill_path)
@@ -864,8 +1082,16 @@ def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
                 if ignore(rel):
                     continue
                 all_findings.extend(scan_file(f, rel))
+        policy_findings = scan_artifact_policy(skill_path, ignore=ignore)
+        metadata_findings, artifact_policy = _artifact_policy_metadata_findings(
+            skill_path, ignore=ignore
+        )
+        policy_findings.extend(metadata_findings)
     elif skill_path.is_file():
         all_findings.extend(scan_file(skill_path, skill_path.name))
+        policy_findings = scan_artifact_policy(skill_path)
+        metadata_findings, artifact_policy = _artifact_policy_metadata_findings(skill_path)
+        policy_findings.extend(metadata_findings)
 
     verdict = _determine_verdict(all_findings)
     summary = _build_summary(skill_name, source, trust_level, verdict, all_findings)
@@ -878,6 +1104,8 @@ def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
         findings=all_findings,
         scanned_at=datetime.now(timezone.utc).isoformat(),
         summary=summary,
+        policy_findings=policy_findings,
+        artifact_policy=artifact_policy,
     )
 
 
@@ -945,6 +1173,8 @@ def scan_skill_cached(
             trust_level=cached["trust_level"], verdict=cached["verdict"],
             findings=[Finding(**item) for item in cached.get("findings", [])],
             scanned_at=cached["scanned_at"], summary=cached.get("summary", ""),
+            policy_findings=[Finding(**item) for item in cached.get("policy_findings", [])],
+            artifact_policy=cached.get("artifact_policy") or {},
         )
         provenance = dict(cached)
         provenance["fresh"] = False
@@ -953,10 +1183,13 @@ def scan_skill_cached(
 
     result = scan_skill(skill_path, source=source)
     findings = [_finding_dict(item) for item in result.findings]
+    policy_findings = [_finding_dict(item) for item in result.policy_findings]
     provenance = {
         "source": source, "source_url": source_url, "bundle_hash": bundle_hash,
         "scanner_version": SCANNER_VERSION, "verdict": result.verdict,
         "trust_level": result.trust_level, "findings": findings,
+        "policy_findings": policy_findings,
+        "artifact_policy": result.artifact_policy,
         "rules": sorted({item["pattern_id"] for item in findings}),
         "scanned_at": result.scanned_at, "summary": result.summary, "fresh": True,
     }
@@ -980,6 +1213,12 @@ def should_allow_install(result: ScanResult, force: bool = False) -> Tuple[bool,
     Returns:
         (allowed, reason) tuple
     """
+    if result.policy_findings and not force:
+        return False, (
+            f"Blocked by artifact policy ({len(result.policy_findings)} findings). "
+            "Use Hermes-managed artifact operations or explicitly label legacy examples."
+        )
+
     policy = INSTALL_POLICY.get(result.trust_level, INSTALL_POLICY["community"])
     vi = VERDICT_INDEX.get(result.verdict, 2)
     decision = policy[vi]
@@ -1035,6 +1274,15 @@ def format_scan_report(result: ScanResult) -> str:
             loc = f"{f.file}:{f.line}".ljust(30)
             lines.append(f"  {sev} {cat} {loc} \"{f.match[:60]}\"")
 
+        lines.append("")
+
+    if result.policy_findings:
+        lines.append("Artifact policy findings:")
+        for finding in result.policy_findings:
+            lines.append(
+                f"  MEDIUM   artifact_lifecycle {finding.file}:{finding.line} "
+                f"{finding.description}"
+            )
         lines.append("")
 
     allowed, reason = should_allow_install(result)

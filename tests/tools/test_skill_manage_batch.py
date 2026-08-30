@@ -54,6 +54,29 @@ class TestSkillManageBatch(unittest.TestCase):
         for rel in ("SKILL.md", "references/a.md", "scripts/r.py"):
             self.assertTrue(os.path.exists(os.path.join(base, rel)), rel)
 
+    def test_successful_batch_finalizes_staging_operation(self):
+        """Successful batches remove snapshots but retain lifecycle metadata."""
+        r = self._call("probe", [
+            {"action": "create", "content": SK.format(n="probe")},
+        ])
+        self.assertTrue(r["success"], r)
+        manifest_dir = os.path.join(self.home, "cache", "terminal", "manifests")
+        manifests = [
+            os.path.join(manifest_dir, name)
+            for name in os.listdir(manifest_dir)
+            if name.endswith(".json")
+        ]
+        self.assertEqual(len(manifests), 1)
+        with open(manifests[0], encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        self.assertEqual(manifest["owner"], "skill-manager")
+        self.assertEqual(manifest["kind"], "staging")
+        self.assertEqual(manifest["status"], "finalized-success")
+        self.assertEqual(
+            os.listdir(os.path.join(self.home, "cache", "terminal", "operations")),
+            [],
+        )
+
     def test_midbatch_failure_rolls_back_existing_skill(self):
         self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
         r = self._call("probe", [

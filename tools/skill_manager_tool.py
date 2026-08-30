@@ -34,10 +34,12 @@ Directory layout for user skills:
 
 import json
 import logging
+import os
 import re
 import shutil
 import threading
 import contextvars as _ctxvars
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1684,7 +1686,23 @@ def _skill_manage_batch(
                 )
 
     # --- snapshot every touched skill for rollback ---
-    snap_root = Path(tempfile.mkdtemp(prefix="skill_batch_"))
+    try:
+        from hermes_cli.config import load_config
+        from tools.artifact_lifecycle import ArtifactManager
+
+        artifact_manager = ArtifactManager.from_config(
+            load_config(), session_id=f"skill-batch-{uuid.uuid4().hex[:12]}"
+        )
+        snapshot_operation = artifact_manager.create_operation(
+            owner="skill-manager",
+            kind="staging",
+            sensitivity="sensitive",
+            retention="manual",
+            pid=os.getpid(),
+        )
+        snap_root = snapshot_operation.root
+    except Exception as exc:  # noqa: BLE001 — no snapshot, no atomicity
+        return tool_error(f"Could not allocate skill batch snapshot: {exc}", success=False)
     snapshots = {}  # skill name -> (pre_dir or None, snapshot_dir or None)
     for nm in dict.fromkeys(names):  # ordered unique
         pre = _find_skill(nm)
@@ -1695,7 +1713,7 @@ def _skill_manage_batch(
             try:
                 shutil.copytree(pre_dir, snap)
             except Exception as exc:  # noqa: BLE001 — no snapshot, no atomicity
-                shutil.rmtree(snap_root, ignore_errors=True)
+                snapshot_operation.finalize("failure")
                 return tool_error(f"Could not snapshot '{nm}' for atomic batch: {exc}", success=False)
         snapshots[nm] = (pre_dir, snap)
 
@@ -1801,7 +1819,7 @@ def _skill_manage_batch(
                 snap_root,
             )
         else:
-            shutil.rmtree(snap_root, ignore_errors=True)
+            snapshot_operation.finalize("success")
 
     return json.dumps(
         {"success": True, "operations_applied": len(results),

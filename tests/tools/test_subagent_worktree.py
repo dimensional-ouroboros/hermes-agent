@@ -4,6 +4,7 @@ Inspired by Muse Code's --subagent-worktree-isolation (clean-room
 implementation from documented behavior).
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -93,6 +94,20 @@ class SubagentWorktreeTests(unittest.TestCase):
         # A write in the worktree does not touch the parent checkout
         (Path(info["path"]) / "child.txt").write_text("x", encoding="utf-8")
         self.assertFalse((repo / "child.txt").exists())
+
+    def test_create_records_artifact_manifest(self):
+        """Record ownership metadata for each created subagent worktree."""
+        repo = _make_repo(self.tmp)
+        info = sw.create_subagent_worktree(str(repo), "manifest1")
+        assert info is not None
+
+        manifest_path = Path(info["artifact_manifest"])
+        self.assertTrue(manifest_path.is_file())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["owner"], "subagent-worktree")
+        self.assertEqual(manifest["kind"], "worktree")
+        self.assertEqual(manifest["status"], "active")
+        self.assertEqual(manifest["worktree_path"], info["path"])
 
     def test_create_unborn_head_returns_none(self):
         repo = self.tmp / "empty"

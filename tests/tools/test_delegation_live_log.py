@@ -49,6 +49,21 @@ def test_writer_precreates_file_with_header():
     assert w.path.parent.parent == live_transcript_root()
 
 
+def test_writer_refuses_preexisting_log_symlink(tmp_path):
+    """Do not redirect a live transcript through a planted symlink."""
+    live_root = tmp_path / "live"
+    delegation_dir = live_root / "deleg_symlink"
+    delegation_dir.mkdir(parents=True)
+    external = tmp_path / "external.log"
+    external.write_text("preserve", encoding="utf-8")
+    (delegation_dir / "task-0.log").symlink_to(external)
+
+    writer = LiveTranscriptWriter("deleg_symlink", 0, "goal", root=live_root)
+
+    assert writer.path is None
+    assert external.read_text(encoding="utf-8") == "preserve"
+
+
 def test_stream_deltas_buffer_and_flush_as_one_line():
     w = LiveTranscriptWriter("deleg_stream", 0, "g")
     w.add_stream_delta("Hello ")
@@ -287,6 +302,47 @@ def test_manifest_model_provider_are_optional_and_default_none():
     )
     assert manifest["model"] is None
     assert manifest["provider"] is None
+
+
+def test_live_manifest_refuses_preexisting_symlink(tmp_path, monkeypatch):
+    """Do not overwrite an external file through the live manifest path."""
+    hermes_home = tmp_path / ".hermes"
+    live_root = hermes_home / "cache" / "delegation" / "live"
+    delegation_dir = live_root / "deleg_symlink_manifest"
+    delegation_dir.mkdir(parents=True)
+    external = tmp_path / "external-manifest.json"
+    external.write_text("preserve", encoding="utf-8")
+    (delegation_dir / "manifest.json").symlink_to(external)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(dll, "live_transcript_root", lambda: live_root)
+
+    delegation_id, _writers, _paths = create_live_transcripts(
+        [{"goal": "safe goal"}], delegation_id="deleg_symlink_manifest"
+    )
+
+    assert delegation_id is None
+    assert external.read_text(encoding="utf-8") == "preserve"
+
+
+def test_live_transcript_files_are_registered_as_ttl_artifacts(tmp_path, monkeypatch):
+    """Register live logs and their metadata in the artifact lifecycle."""
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    delegation_id, _writers, _paths = create_live_transcripts(
+        [{"goal": "tracked live task"}]
+    )
+
+    manifests = list((hermes_home / "cache" / "terminal" / "manifests").glob("*.json"))
+    assert len(manifests) == 1
+    artifact = json.loads(manifests[0].read_text(encoding="utf-8"))
+    assert artifact["owner"] == "delegate-task-live-log"
+    assert artifact["kind"] == "spillover"
+    assert artifact["sensitivity"] == "sensitive"
+    assert artifact["cleanup_policy"] == "ttl"
+    assert artifact["status"] == "active"
+    assert artifact["delegation_id"] == delegation_id
+    assert len(artifact["relative_paths"]) == 2
 
 
 def test_no_file_in_the_dispatch_directory_carries_the_raw_key():

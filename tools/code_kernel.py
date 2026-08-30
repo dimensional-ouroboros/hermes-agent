@@ -254,6 +254,7 @@ class SessionKernel:
         self.lock = threading.Lock()
         self.proc: Optional[subprocess.Popen] = None
         self.tmpdir: str = ""
+        self.artifact_operation: Any = None
         self.sock_path: Optional[str] = None
         self.server_sock: Optional[socket.socket] = None
         self.stop_event = threading.Event()
@@ -269,6 +270,7 @@ class SessionKernel:
         self.execution_count = 0
         self.last_used: float = time.monotonic()
         self.cell_authority: Optional[CellAuthority] = None
+        self.closing = False
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -377,11 +379,17 @@ def _reap_unlocked() -> List[SessionKernel]:
     """Pop idle-expired kernels; caller tears them down outside the lock."""
     _, idle_timeout = _lifecycle_limits()
     now = time.monotonic()
-    doomed = [
-        key
-        for key, kernel in _KERNELS.items()
-        if now - kernel.last_used > idle_timeout
-    ]
+    doomed = []
+    for key, kernel in _KERNELS.items():
+        if now - kernel.last_used <= idle_timeout:
+            continue
+        if kernel.lock.acquire(blocking=False):
+            try:
+                if not kernel.closing:
+                    kernel.closing = True
+                    doomed.append(key)
+            finally:
+                kernel.lock.release()
     return [_KERNELS.pop(key) for key in doomed]
 
 
@@ -390,12 +398,23 @@ def _evict_over_cap_unlocked(keep: Tuple) -> List[SessionKernel]:
     cap, _ = _lifecycle_limits()
     if len(_KERNELS) <= cap:
         return []
-    by_age = sorted(
-        (key for key in _KERNELS if key != keep),
-        key=lambda key: _KERNELS[key].last_used,
-    )
-    doomed = by_age[: len(_KERNELS) - cap]
-    return [_KERNELS.pop(key) for key in doomed]
+    candidates = []
+    locked = []
+    for key, kernel in _KERNELS.items():
+        if key == keep or kernel.closing:
+            continue
+        if not kernel.lock.acquire(blocking=False):
+            continue
+        locked.append((key, kernel))
+        candidates.append(key)
+    by_age = sorted(candidates, key=lambda key: _KERNELS[key].last_used)
+    doomed_keys = by_age[: max(0, len(_KERNELS) - cap)]
+    doomed = set(doomed_keys)
+    for key, kernel in locked:
+        if key in doomed:
+            kernel.closing = True
+        kernel.lock.release()
+    return [_KERNELS.pop(key) for key in doomed_keys]
 
 
 atexit.register(shutdown_all_kernels)
@@ -418,7 +437,12 @@ def _teardown(kernel: SessionKernel) -> None:
             os.unlink(kernel.sock_path)
         except OSError:
             pass
-    if kernel.tmpdir:
+    if kernel.artifact_operation is not None:
+        try:
+            kernel.artifact_operation.finalize("cancelled")
+        except Exception:
+            logger.debug("Failed to finalize session-kernel artifact operation", exc_info=True)
+    elif kernel.tmpdir:
         import shutil
 
         shutil.rmtree(kernel.tmpdir, ignore_errors=True)
@@ -543,6 +567,40 @@ def _stderr_reader(kernel: SessionKernel) -> None:
         _append_bounded(kernel.stderr_chunks, kernel.stderr_bytes, chunk, MAX_STDERR_BYTES)
 
 
+def _bind_kernel_server_socket(tmpdir: str | os.PathLike[str]):
+    """Bind a kernel RPC socket using the platform-safe transport."""
+    if _IS_WINDOWS:
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.bind(("127.0.0.1", 0))
+        host, port = server_sock.getsockname()[:2]
+        sock_path = None
+        endpoint = f"tcp://{host}:{port}"
+    elif sys.platform.startswith("linux"):
+        server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        abstract_name = f"hermes_rpc_{uuid.uuid4().hex}"
+        server_sock.bind("\0" + abstract_name)
+        sock_path = None
+        endpoint = f"abstract://{abstract_name}"
+    else:
+        candidates = [
+            os.path.join(os.fspath(tmpdir), "hermes-rpc.sock"),
+            os.path.join(tempfile.gettempdir(), f"hermes_rpc_{uuid.uuid4().hex}.sock"),
+            os.path.join("/tmp", f"hermes_rpc_{uuid.uuid4().hex}.sock"),
+        ]
+        sock_path = next(
+            (candidate for candidate in candidates if len(os.fsencode(candidate)) < 100),
+            None,
+        )
+        if sock_path is None:
+            raise OSError("could not allocate a short filesystem socket path")
+        server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server_sock.bind(sock_path)
+        os.chmod(sock_path, 0o600)
+        endpoint = sock_path
+    server_sock.listen(1)
+    return server_sock, sock_path, endpoint
+
+
 def _spawn(kernel: SessionKernel, *, task_id: str, child_python: str,
            child_cwd: str, sandbox_tools: frozenset, max_tool_calls: int) -> None:
     from tools.code_execution_tool import (
@@ -550,25 +608,28 @@ def _spawn(kernel: SessionKernel, *, task_id: str, child_python: str,
         generate_hermes_tools_module,
     )
 
-    kernel.tmpdir = tempfile.mkdtemp(prefix="hermes_kernel_")
-    _sock_tmpdir = "/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+    try:
+        from hermes_cli.config import load_config
+        from tools.artifact_lifecycle import ArtifactManager
 
+        manager = ArtifactManager.from_config(
+            load_config(), session_id=f"kernel-{uuid.uuid4().hex[:12]}"
+        )
+        kernel.artifact_operation = manager.create_operation(
+            owner="code-kernel",
+            kind="staging",
+            sensitivity="sensitive",
+            retention="finalize",
+            pid=os.getpid(),
+        )
+        kernel.tmpdir = str(kernel.artifact_operation.root)
+    except Exception as exc:
+        logger.error("Session-kernel artifact allocation failed", exc_info=True)
+        raise RuntimeError("Could not allocate managed session-kernel artifacts") from exc
     kernel.rpc_token = secrets.token_urlsafe(32)
     kernel.sentinel = "@@HERMES-KERNEL-" + secrets.token_urlsafe(16) + "@@"
 
-    if _IS_WINDOWS:
-        kernel.sock_path = None
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.bind(("127.0.0.1", 0))
-        host, port = server_sock.getsockname()[:2]
-        rpc_endpoint = f"tcp://{host}:{port}"
-    else:
-        kernel.sock_path = os.path.join(_sock_tmpdir, f"hermes_rpc_{uuid.uuid4().hex}.sock")
-        server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server_sock.bind(kernel.sock_path)
-        os.chmod(kernel.sock_path, 0o600)
-        rpc_endpoint = kernel.sock_path
-    server_sock.listen(1)
+    server_sock, kernel.sock_path, rpc_endpoint = _bind_kernel_server_socket(kernel.tmpdir)
     kernel.server_sock = server_sock
 
     tools_src = generate_hermes_tools_module(list(sandbox_tools))
@@ -674,6 +735,10 @@ def execute_in_session_kernel(
             _KERNELS[key] = kernel
         kernel.last_used = time.monotonic()
         expired.extend(_evict_over_cap_unlocked(keep=key))
+        # Claim the cell lock before releasing the registry lock. This closes
+        # the race where an idle reaper or cap eviction removes a kernel after
+        # selection but before the caller begins its cell.
+        kernel.lock.acquire()
     for doomed in expired:
         _teardown(doomed)
     reused = kernel.proc is not None
@@ -684,7 +749,7 @@ def execute_in_session_kernel(
     # tool calls under this cell's approval/session/turn identity.
     authority = CellAuthority(task_id)
 
-    with kernel.lock:
+    try:
         try:
             if kernel.proc is None:
                 _spawn(
@@ -844,3 +909,5 @@ def execute_in_session_kernel(
             # timeout, exit, kernel death): its tool authority retires with
             # it, so nothing the cell left running can dispatch under it.
             authority.retire()
+    finally:
+        kernel.lock.release()

@@ -14,6 +14,8 @@ watch a child work instead of waiting blind for the consolidated summary.
 Placement under ``cache/delegation`` is deliberate: that directory is
 mounted read-only into remote terminal backends (Docker/Modal/SSH) via
 ``credential_files._CACHE_DIRS``, so the logs are readable from any backend.
+Each log and its dispatch manifest are also registered as a sensitive TTL
+artifact, so retention and orphan handling use the shared lifecycle metadata.
 
 Design constraints:
 
@@ -31,7 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
+import os
 import threading
 import time
 import uuid
@@ -127,7 +129,12 @@ class LiveTranscriptWriter:
         try:
             base = (root if root is not None else live_transcript_root())
             d = base / delegation_id
+            if d.is_symlink():
+                raise OSError(f"live transcript directory is a symlink: {d}")
             d.mkdir(parents=True, exist_ok=True)
+            from tools.spill_safety import ensure_spill_dir, write_text_exclusive
+
+            ensure_spill_dir(d, private=True)
             self.path: Optional[Path] = d / f"task-{task_index}.log"
             header = [
                 "=== Hermes subagent live transcript ===",
@@ -139,7 +146,7 @@ class LiveTranscriptWriter:
                 "(append-only; streams while the subagent runs — tail -f me)",
                 "=" * 40,
             ]
-            self.path.write_text("\n".join(header) + "\n", encoding="utf-8")
+            write_text_exclusive(self.path, "\n".join(header) + "\n", private=True)
             self.event("user", "kickoff: " + _one_line(goal, _KICKOFF_MAX)
                        + (f" | context: {_one_line(context, _KICKOFF_MAX)}" if context else ""))
         except Exception as exc:
@@ -161,7 +168,9 @@ class LiveTranscriptWriter:
             with self._lock:
                 # Append mode per write: no held handle, survives child crash,
                 # and the close() acts as the flush.
-                with open(self.path, "a", encoding="utf-8") as fh:
+                flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(self.path, flags)
+                with os.fdopen(fd, "a", encoding="utf-8") as fh:
                     fh.write(line)
         except Exception as exc:
             self._ok = False
@@ -327,23 +336,51 @@ def create_live_transcripts(
         prune_stale_live_dirs()
     except Exception:
         pass
+    artifact_operation = None
     try:
         deleg_id = delegation_id or new_live_delegation_id()
+        base = live_transcript_root()
+        base.mkdir(parents=True, exist_ok=True)
+        from hermes_cli.config import load_config
+        from tools.artifact_lifecycle import ArtifactManager
+
+        artifact_operation = ArtifactManager.from_config(
+            load_config(), session_id=f"delegation-live-{deleg_id}"
+        ).create_operation(
+            owner="delegate-task-live-log",
+            kind="spillover",
+            sensitivity="sensitive",
+            retention="ttl",
+            retention_seconds=LIVE_RETENTION_DAYS * 86400,
+            pid=os.getpid(),
+            payload_root=base,
+        )
         writers: List[Optional[LiveTranscriptWriter]] = []
         paths: List[str] = []
         for i, t in enumerate(task_list):
             w = LiveTranscriptWriter(
                 deleg_id, i, str(t.get("goal", "")),
                 context=t.get("context") or context,
+                root=base,
             )
             writers.append(w if w.path is not None else None)
             if w.path is not None:
                 paths.append(str(w.path))
         if not paths:
+            artifact_operation.finalize("failure")
             return None, [None] * n, []
         _write_manifest(deleg_id, task_list, paths, model=model, provider=provider)
+        artifact_operation.annotate(delegation_id=deleg_id)
+        for path in paths:
+            artifact_operation.register_existing(path)
+        artifact_operation.register_existing(_manifest_path(deleg_id))
         return deleg_id, writers, paths
     except Exception as exc:
+        if artifact_operation is not None:
+            try:
+                artifact_operation.finalize("failure")
+            except Exception:
+                logger.debug("Live transcript artifact finalization failed", exc_info=True)
         logger.debug("Live transcript creation failed: %s", exc)
         return None, [None] * n, []
 
@@ -377,8 +414,16 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                 for i, t in enumerate(task_list)
             ],
         }
-        _manifest_path(delegation_id).write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+        from tools.spill_safety import write_text_exclusive
+
+        manifest_path = _manifest_path(delegation_id)
+        if manifest_path.is_symlink():
+            raise OSError(f"live transcript manifest is a symlink: {manifest_path}")
+        write_text_exclusive(
+            manifest_path,
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+            private=True,
+            overwrite=manifest_path.exists(),
         )
     except Exception as exc:
         logger.debug("Live transcript manifest write failed: %s", exc)
@@ -391,6 +436,8 @@ def update_manifest_statuses(delegation_id: Optional[str],
         return
     try:
         mp = _manifest_path(delegation_id)
+        if mp.is_symlink():
+            return
         manifest = json.loads(mp.read_text(encoding="utf-8"))
         by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
         for task in manifest.get("tasks", []):
@@ -400,8 +447,14 @@ def update_manifest_statuses(delegation_id: Optional[str],
                 if r.get("exit_reason"):
                     task["exit_reason"] = r["exit_reason"]
         manifest["completed"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        mp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
-                      encoding="utf-8")
+        from tools.spill_safety import write_text_exclusive
+
+        write_text_exclusive(
+            mp,
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+            private=True,
+            overwrite=True,
+        )
     except Exception as exc:
         logger.debug("Live transcript manifest update failed: %s", exc)
 
@@ -417,11 +470,35 @@ def prune_stale_live_dirs(max_age_days: int = LIVE_RETENTION_DAYS) -> int:
         if not root.is_dir():
             return 0
         cutoff = time.time() - max_age_days * 86400
+        artifact_manager = None
+        operation_by_delegation: dict[str, str] = {}
+        try:
+            from hermes_cli.config import load_config
+            from tools.artifact_lifecycle import ArtifactManager
+
+            artifact_manager = ArtifactManager.from_config(load_config())
+            operation_by_delegation = {
+                str(item.get("delegation_id")): str(item["operation_id"])
+                for item in artifact_manager.list_operations(
+                    owner="delegate-task-live-log", status="active"
+                )
+                if item.get("delegation_id") and item.get("operation_id")
+            }
+        except Exception:
+            logger.debug("Live transcript lifecycle lookup failed", exc_info=True)
         for child in root.iterdir():
             try:
                 if child.is_dir() and child.stat().st_mtime < cutoff:
-                    shutil.rmtree(child, ignore_errors=True)
-                    removed += 1
+                    operation_id = operation_by_delegation.get(child.name)
+                    if artifact_manager is not None and operation_id:
+                        operation = artifact_manager.load_operation(operation_id)
+                        cleanup = operation.finalize("success")
+                    else:
+                        from tools.artifact_lifecycle import remove_owned_tree
+
+                        cleanup = remove_owned_tree(child, allowed_root=root)
+                    if not cleanup["failures"]:
+                        removed += 1
             except OSError:
                 continue
     except Exception as exc:

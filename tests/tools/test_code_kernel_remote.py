@@ -118,6 +118,22 @@ class TestSpawnAndReuse(RemoteKernelBase):
             sum(1 for c in env.commands if "nohup" in c), 1,
         )
 
+    def test_remote_kernel_cleanup_uses_bounded_reaper(self):
+        """Remote kernel teardown must remove only its owned tree."""
+        env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
+        _run(env)
+
+        shutdown_all_remote_kernels()
+
+        cleanup = [
+            command
+            for command in env.commands
+            if "hermes_rkernel_" in command and "python3 -c" in command
+        ]
+        self.assertTrue(cleanup)
+        self.assertTrue(all("rm -rf" not in command for command in cleanup))
+        self.assertTrue(all("os.walk" in command for command in cleanup))
+
     def test_spawn_failure_fails_open(self):
         env = ScriptedEnv([
             ("nohup", lambda c: {"output": "sh: cannot fork\n", "returncode": 1}),

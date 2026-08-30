@@ -91,6 +91,8 @@ def cleanup_terminal_temp_cache(
             group_newest[key] = max(group_newest.get(key, 0.0), mt)
 
     for f in entries:
+        if f.name in {"operations", "manifests"}:
+            continue
         try:
             mt = f.stat().st_mtime
         except OSError:
@@ -101,7 +103,11 @@ def cleanup_terminal_temp_cache(
             continue
         try:
             if f.is_dir():
-                shutil.rmtree(f, ignore_errors=True)
+                from tools.artifact_lifecycle import remove_owned_tree
+
+                cleanup = remove_owned_tree(f, allowed_root=root)
+                if cleanup["failures"]:
+                    continue
             else:
                 f.unlink()
             removed += 1
@@ -1853,6 +1859,27 @@ class LocalEnvironment(BaseEnvironment):
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
         super().__init__(cwd=cwd, timeout=timeout, env=env)
+        self._artifact_operation = None
+        try:
+            from tools.artifact_lifecycle import ArtifactManager
+
+            manager = ArtifactManager(self.get_temp_dir(), session_id=self._session_id)
+            self._artifact_operation = manager.create_operation(
+                owner="local-terminal",
+                kind="process",
+                sensitivity="secret-bearing",
+                retention="ttl",
+                retention_seconds=TERMINAL_TEMP_MAX_AGE_HOURS * 3600,
+                pid=os.getpid(),
+            )
+            self._snapshot_path = str(
+                self._artifact_operation.path(f"hermes-snap-{self._session_id}.sh")
+            )
+            self._cwd_file = str(
+                self._artifact_operation.path(f"hermes-cwd-{self._session_id}.txt")
+            )
+        except Exception as exc:
+            logger.debug("Could not create managed terminal artifact operation: %s", exc)
         self.init_session()
 
     def get_temp_dir(self) -> str:
@@ -2179,6 +2206,9 @@ class LocalEnvironment(BaseEnvironment):
 
     def cleanup(self):
         """Clean up temp files."""
+        if self._artifact_operation is not None:
+            self._artifact_operation.finalize("cancelled")
+            return
         for f in (self._snapshot_path, self._cwd_file):
             try:
                 os.unlink(f)

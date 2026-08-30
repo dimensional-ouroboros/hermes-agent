@@ -13275,6 +13275,13 @@ def main():
 
     worktree_parser.set_defaults(func=_dispatch_worktree)
 
+    # =========================================================================
+    # artifacts command — inspect and manage owned temporary artifacts
+    # =========================================================================
+    from hermes_cli.artifacts_cmd import cmd_artifacts, register_parser as register_artifacts_parser
+
+    register_artifacts_parser(subparsers, cmd_artifacts)
+
 
     # =========================================================================
     # browser command — real-profile helpers (agent-invoked, user-approved)

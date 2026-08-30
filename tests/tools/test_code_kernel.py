@@ -19,8 +19,10 @@ tests patch ``_load_config`` directly, mirroring test_code_execution_modes.
 import json
 import os
 import sys
+import time
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -41,7 +43,7 @@ from tools.code_execution_tool import (
     build_execute_code_schema,
     execute_code,
 )
-from tools.code_kernel import _KERNELS, shutdown_all_kernels
+from tools.code_kernel import SessionKernel, _KERNELS, shutdown_all_kernels
 
 
 @contextmanager
@@ -120,7 +122,70 @@ class TestSessionStatePersistence(unittest.TestCase):
         self.assertIn('{"k": 1}', second["output"])
 
 
+def test_session_kernel_uses_managed_artifact_operation(tmp_path, monkeypatch):
+    """Session kernel staging belongs to the managed Hermes artifact root."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    with _kernel_config():
+        result = _run("print('managed')")
+
+    assert result["status"] == "success", result
+    kernel = next(iter(_KERNELS.values()))
+    assert kernel.artifact_operation is not None
+    assert Path(kernel.tmpdir).is_relative_to(
+        tmp_path / ".hermes" / "cache" / "terminal" / "operations"
+    )
+
+
+def test_macos_kernel_uses_managed_filesystem_socket(tmp_path, monkeypatch):
+    """Use a filesystem socket on macOS, where abstract sockets are unsupported."""
+    import tools.code_kernel as code_kernel
+
+    monkeypatch.setattr(code_kernel, "_IS_WINDOWS", False)
+    monkeypatch.setattr(code_kernel.sys, "platform", "darwin")
+
+    server_sock, sock_path, endpoint = code_kernel._bind_kernel_server_socket(tmp_path)
+    try:
+        assert sock_path is not None
+        assert endpoint == sock_path
+        assert len(sock_path.encode()) < 104
+        assert Path(sock_path).is_socket()
+    finally:
+        server_sock.close()
+        Path(sock_path).unlink(missing_ok=True)
+
+
+def test_busy_kernel_is_not_reaped_or_evicted(monkeypatch):
+    """Keep a kernel registered while another thread owns its cell lock."""
+    import tools.code_kernel as code_kernel
+
+    key = ("busy", "strict", "python", "/tmp", ())
+    other_key = ("other", "strict", "python", "/tmp", ())
+    kernel = SessionKernel(key)
+    other = SessionKernel(other_key)
+    kernel.last_used = 0
+    other.last_used = 1
+    kernel.lock.acquire()
+    _KERNELS[key] = kernel
+    _KERNELS[other_key] = other
+    try:
+        monkeypatch.setattr(code_kernel, "_lifecycle_limits", lambda: (0, 1))
+
+        expired = code_kernel._reap_unlocked()
+        assert kernel not in expired
+        other.last_used = time.monotonic()
+        _KERNELS[other_key] = other
+        evicted = code_kernel._evict_over_cap_unlocked(keep=("keep",))
+        assert kernel not in evicted
+        assert _KERNELS[key] is kernel
+    finally:
+        kernel.lock.release()
+        _KERNELS.pop(key, None)
+        _KERNELS.pop(other_key, None)
+
+
 class TestKernelLifecycle(unittest.TestCase):
+
     def test_timeout_kills_the_kernel_and_reports_state_loss(self):
         with _kernel_config(timeout=1):
             slow = _run("import time\ntime.sleep(30)")

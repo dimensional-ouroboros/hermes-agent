@@ -17,6 +17,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -321,13 +322,21 @@ def _inspect_connection(conn: sqlite3.Connection) -> dict[str, Any]:
 def _snapshot_and_inspect(
     source: Path,
     work_root: Path,
-) -> tuple[tempfile.TemporaryDirectory[str], Path, dict[str, Any]]:
+) -> tuple[Any, Path, dict[str, Any]]:
     before = _source_fingerprint(source)
-    temp_dir = tempfile.TemporaryDirectory(
-        prefix="hermes-session-recovery-",
-        dir=str(work_root),
+    from tools.artifact_lifecycle import ArtifactManager
+
+    operation = ArtifactManager(
+        work_root,
+        session_id=f"session-recovery-{uuid.uuid4().hex[:12]}",
+    ).create_operation(
+        owner="session-recovery",
+        kind="recovery",
+        sensitivity="sensitive",
+        retention="finalize",
+        pid=os.getpid(),
     )
-    snapshot_dir = Path(temp_dir.name)
+    snapshot_dir = operation.root
     try:
         snapshot_source, copied = _copy_source_bundle(source, snapshot_dir)
         after = _source_fingerprint(source)
@@ -356,9 +365,9 @@ def _snapshot_and_inspect(
             conn.close()
         inspection["source_bundle"] = copied
         inspection["source_fingerprint"] = before
-        return temp_dir, snapshot_source, inspection
+        return operation, snapshot_source, inspection
     except BaseException:
-        temp_dir.cleanup()
+        operation.finalize("failure")
         raise
 
 
@@ -382,7 +391,7 @@ def inspect_session_database(
             == inspection["source_fingerprint"],
         }
     finally:
-        temp_dir.cleanup()
+        temp_dir.finalize("success")
 
 
 def _copy_table(
@@ -1557,6 +1566,7 @@ def recover_session_database(
     disk_space = _disk_space_preflight(source, work_root, output.parent)
 
     temp_dir, snapshot_source, inspection = _snapshot_and_inspect(source, work_root)
+    outcome = "failure"
     try:
         if not inspection.get("recoverable") and not allow_partial:
             reasons = "; ".join(inspection.get("errors") or ["unknown source error"])
@@ -1575,15 +1585,17 @@ def recover_session_database(
                 # SQL-level salvage is impossible without readable table
                 # schemas. Fall back to page-level lost_and_found salvage via
                 # the sqlite3 CLI's .recover (a shell-only feature).
-                return _recover_via_lost_and_found(
+                result = _recover_via_lost_and_found(
                     source=source,
                     snapshot_source=snapshot_source,
-                    snapshot_dir=Path(temp_dir.name),
+                    snapshot_dir=temp_dir.root,
                     output=output,
                     inspection=inspection,
                     disk_space=disk_space,
                     missing_required=missing_required,
                 )
+                outcome = "success"
+                return result
 
         source_conn = sqlite3.connect(
             str(snapshot_source),
@@ -1694,7 +1706,7 @@ def recover_session_database(
             )
             verification["complete"] = False
 
-        return {
+        result = {
             "operation": "recover",
             "allow_partial": allow_partial,
             "source": str(source),
@@ -1718,8 +1730,10 @@ def recover_session_database(
             "verified": bool(verification.get("healthy") and source_unchanged),
             "installed": False,
         }
+        outcome = "success"
+        return result
     finally:
-        temp_dir.cleanup()
+        temp_dir.finalize(outcome)
 
 
 def write_recovery_report(path: Path, report: dict[str, Any]) -> Path:

@@ -21,7 +21,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from pathlib import Path
-from typing import IO, Callable, Iterable, Protocol
+from typing import IO, Any, Callable, Iterable, Protocol
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -106,6 +106,7 @@ class _BoundedOutputCollector:
         self._spill_fh: IO[str] | None = None
         self._spill_chars = 0
         self._spill_capped = False
+        self._artifact_operation: Any = None
 
     def _maybe_spill(self, text: str) -> None:
         """Tee ``text`` to the spill file (opened lazily on first overflow)."""
@@ -1084,25 +1085,50 @@ class BaseEnvironment(ABC):
             # accumulate-everything semantics.
             capture_limit = _UNBOUNDED_CAPTURE_CHARS
         spill_path = None
+        spill_operation = None
         if bounded_capture:
             # Foreground terminal path: tee overflow to a spill file so a
             # truncated result is recoverable without re-running (the file
             # only gets created if output actually exceeds the cap).
             try:
-                spill_dir = get_hermes_home() / "cache" / "terminal-output"
-                spill_path = spill_dir / f"out-{int(time.time())}-{os.getpid()}-{id(proc) & 0xffff:x}.log"
-                # Opportunistic cleanup of spills older than 7 days.
-                if spill_dir.is_dir():
+                from hermes_cli.config import load_config
+                from tools.artifact_lifecycle import ArtifactManager
+
+                manager = ArtifactManager.from_config(load_config())
+                spill_dir = manager.root / "spillover"
+                spill_dir.mkdir(parents=True, exist_ok=True)
+                spill_operation = manager.create_operation(
+                    owner="terminal-output",
+                    kind="spillover",
+                    sensitivity="sensitive",
+                    retention="ttl",
+                    retention_seconds=7 * 86400,
+                    pid=os.getpid(),
+                    payload_root=spill_dir,
+                )
+                spill_path = spill_operation.path(
+                    f"out-{int(time.time())}-{os.getpid()}-{id(proc) & 0xffff:x}.log"
+                )
+                # Opportunistic cleanup of legacy spills older than 7 days.
+                legacy_spill_dir = get_hermes_home() / "cache" / "terminal-output"
+                if legacy_spill_dir.is_dir():
                     cutoff = time.time() - 7 * 86400
-                    for old in spill_dir.glob("out-*.log"):
+                    for old in legacy_spill_dir.glob("out-*.log"):
                         try:
                             if old.stat().st_mtime < cutoff:
                                 old.unlink()
                         except OSError:
                             pass
             except Exception:
+                if spill_operation is not None:
+                    try:
+                        spill_operation.finalize("failure")
+                    except Exception:
+                        logger.debug("Failed to finalize terminal spill operation", exc_info=True)
                 spill_path = None
+                spill_operation = None
         output = _BoundedOutputCollector(capture_limit, spill_path=spill_path)
+        output._artifact_operation = spill_operation
 
         # Non-blocking drain via select().
         #
@@ -1343,6 +1369,20 @@ class BaseEnvironment(ABC):
                 drain_thread.join(timeout=2)
             except Exception:
                 pass  # cleanup is best-effort
+            try:
+                self._finalize_wait_result(
+                    output,
+                    output.render(suffix="\n[Command interrupted]"),
+                    130,
+                )
+                operation = output._artifact_operation
+                if operation is not None and operation.metadata.get("status") in {
+                    "active",
+                    "orphaned",
+                }:
+                    operation.finalize("cancelled")
+            except Exception:
+                logger.debug("Failed to finalize interrupted terminal artifacts", exc_info=True)
             raise
 
         # Drain thread now exits promptly after bash does (~300ms idle
@@ -1387,9 +1427,20 @@ class BaseEnvironment(ABC):
         """Assemble a wait result, attaching spill metadata when overflow occurred."""
         result = {"output": rendered, "returncode": returncode}
         spill = collector.close_spill()
+        operation = collector._artifact_operation
         if spill:
+            if operation is not None:
+                try:
+                    operation.register_existing(spill)
+                except Exception as exc:
+                    operation.metadata["status"] = "quarantined"
+                    operation.metadata["outcome"] = "spill-registration-failed"
+                    operation.metadata["cleanup"] = {"failures": [str(exc)]}
+                    operation._save()
             result["output_total_chars"] = collector.total_chars
             result["full_output_path"] = spill
+        elif operation is not None:
+            operation.finalize("success")
         return result
 
     def _kill_process(self, proc: ProcessHandle):

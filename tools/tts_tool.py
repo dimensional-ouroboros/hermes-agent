@@ -1348,8 +1348,14 @@ def _generate_command_tts(
     output_format = _get_command_tts_output_format(config, str(output))
     speed = config.get("speed", tts_config.get("speed", ""))
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        text_path = Path(tmpdir) / "input.txt"
+    from tools.artifact_lifecycle import managed_artifact_operation
+
+    with managed_artifact_operation(
+        owner="tts",
+        kind="staging",
+        sensitivity="sensitive",
+    ) as operation:
+        text_path = operation.path("input.txt")
         text_path.write_text(text, encoding="utf-8")
 
         placeholders = {

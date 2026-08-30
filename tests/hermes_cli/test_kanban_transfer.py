@@ -130,6 +130,22 @@ def test_round_trip_preserves_content(kanban_root, tmp_path):
     assert tasks["scratch task"]["assignee"] == "coder"
 
 
+def test_export_registers_and_finalizes_staging(kanban_root, tmp_path):
+    """Export staging is owned by Hermes and finalized after archive creation."""
+    source_root = kanban_root("source")
+    _seed_board()
+
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+
+    assert Path(archive).is_file()
+    manifests = list((source_root / "cache" / "terminal" / "manifests").glob("*.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    assert manifest["owner"] == "kanban-transfer"
+    assert manifest["kind"] == "staging"
+    assert manifest["status"] == "finalized-success"
+
+
 def test_attachment_blob_travels_and_is_readable(kanban_root, tmp_path):
     _seed_board()
     archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]

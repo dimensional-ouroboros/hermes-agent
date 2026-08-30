@@ -18,7 +18,9 @@ import pytest
 import json
 import os
 import socket
+import tempfile
 import time
+from pathlib import Path
 
 os.environ["TERMINAL_ENV"] = "local"
 
@@ -194,11 +196,25 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
                          if "mkdir -p" in cmd and "hermes_exec_" in cmd)
         run_cmd = next(cmd for cmd, _, _ in env.commands if "python3 script.py" in cmd)
         cleanup_cmd = next(cmd for cmd, _, _ in env.commands
-                           if "rm -rf" in cmd and "hermes_exec_" in cmd)
+                           if "python3 -c" in cmd and "hermes_exec_" in cmd)
         self.assertIn("mkdir -p /data/data/com.termux/files/usr/tmp/hermes_exec_", mkdir_cmd)
         self.assertIn("HERMES_RPC_DIR=/data/data/com.termux/files/usr/tmp/hermes_exec_", run_cmd)
-        self.assertIn("rm -rf /data/data/com.termux/files/usr/tmp/hermes_exec_", cleanup_cmd)
+        self.assertIn("os.walk", cleanup_cmd)
+        self.assertNotIn("rm -rf", cleanup_cmd)
         self.assertNotIn("mkdir -p /tmp/hermes_exec_", mkdir_cmd)
+
+    def test_remote_cleanup_uses_owned_file_by_file_reaper(self):
+        """Remote sandbox cleanup must not issue unbounded recursive deletion."""
+        from tools.code_execution_tool import _remote_cleanup_command
+
+        command = _remote_cleanup_command(
+            "/tmp/hermes_exec_abc123",
+            "/tmp",
+        )
+
+        self.assertNotIn("rm -rf", command)
+        self.assertIn("os.walk", command)
+        self.assertIn("hermes_exec_", command)
 
     def test_timezone_shell_quoted_in_remote_execution(self):
         """HERMES_TIMEZONE must be shell-quoted in remote env_prefix to prevent injection."""
@@ -259,6 +275,33 @@ class TestExecuteCode(unittest.TestCase):
                 enabled_tools=enabled_tools or list(SANDBOX_ALLOWED_TOOLS),
             )
         return json.loads(result)
+
+    def test_legacy_per_call_path_uses_managed_operation(self):
+        """Keep the compatibility per-call path inside lifecycle ownership."""
+        import tools.code_execution_tool as code_execution_tool
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hermes_home = Path(temp_dir) / ".hermes"
+            with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+                with patch.object(code_execution_tool, "_get_kernel_mode", return_value="per-call"):
+                    with patch.object(
+                        code_execution_tool,
+                        "_load_config",
+                        return_value={"mode": "strict", "timeout": 10, "max_tool_calls": 5},
+                    ):
+                        result = self._run('print("managed")')
+
+                assert result["status"] == "success"
+                manifests = list(
+                    (hermes_home / "cache" / "terminal" / "manifests").glob("*.json")
+                )
+                execute_manifests = []
+                for path in manifests:
+                    metadata = json.loads(path.read_text(encoding="utf-8"))
+                    if metadata.get("owner") == "execute-code":
+                        execute_manifests.append(metadata)
+                assert len(execute_manifests) == 1
+                assert execute_manifests[0]["status"] == "finalized-success"
 
     def test_basic_print(self):
         """Script that just prints -- no tool calls."""

@@ -15,6 +15,7 @@ Covers the bundled plugin at ``plugins/disk-cleanup/``:
 import importlib
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -243,6 +244,49 @@ class TestTrackForgetQuick:
         dg.track(str(p), "temp", silent=True)
         assert dg.forget(str(p)) == 1
         assert p.exists()  # forget does NOT delete the file
+
+    def test_quick_removes_directory_without_recursive_api(self, _isolate_env, monkeypatch):
+        """Use the bounded remover for stale tracked directories."""
+        dg = _load_lib()
+        path = _isolate_env / "stale-dir"
+        path.mkdir()
+        (path / "nested.txt").write_text("x")
+        tracked = dg.get_tracked_file()
+        tracked.parent.mkdir(parents=True, exist_ok=True)
+        tracked.write_text(json.dumps([{
+            "path": str(path),
+            "category": "temp",
+            "timestamp": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat(),
+            "size": 1,
+        }]))
+        monkeypatch.setattr(dg.shutil, "rmtree", lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("recursive cleanup must not be used")
+        ))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 1
+        assert not path.exists()
+
+    def test_quick_never_deletes_stale_entry_outside_owned_roots(self, _isolate_env):
+        """Skip stale tracked paths that are no longer Hermes-owned."""
+        dg = _load_lib()
+        outside = Path.home() / f"not-hermes-owned-{_isolate_env.name}.txt"
+        outside.write_text("keep")
+        tracked = dg.get_tracked_file()
+        tracked.parent.mkdir(parents=True, exist_ok=True)
+        tracked.write_text(json.dumps([{
+            "path": str(outside),
+            "category": "temp",
+            "timestamp": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat(),
+            "size": outside.stat().st_size,
+        }]))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert outside.read_text(encoding="utf-8") == "keep"
+        outside.unlink()
 
 
 class TestStatus:

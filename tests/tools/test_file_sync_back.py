@@ -1,6 +1,7 @@
 """Tests for FileSyncManager.sync_back() — pull remote changes to host."""
 
 import io
+import json
 import logging
 import os
 import signal
@@ -128,6 +129,36 @@ class TestSyncBackNoChanges:
 
         # Host file should be unchanged (same content, same bytes)
         assert host_file.read_bytes() == host_content
+
+
+class TestSyncBackArtifactLifecycle:
+    """Sync-back staging uses the Hermes artifact lifecycle."""
+
+    def test_sync_back_registers_and_finalizes_staging(self, tmp_path):
+        """Register temporary tar and extraction state under Hermes home."""
+        host_file = tmp_path / "host" / "skill.py"
+        original_content = b"print('v1')"
+        _write_file(host_file, original_content)
+        remote_path = "/root/.hermes/skill.py"
+        download_fn = _make_download_fn({
+            "root/.hermes/skill.py": b"print('v2')",
+        })
+        mgr = _make_manager(
+            tmp_path,
+            file_mapping=[(str(host_file), remote_path)],
+            bulk_download_fn=download_fn,
+        )
+        mgr._pushed_hashes[remote_path] = _sha256_bytes(original_content)
+        hermes_home = tmp_path / ".hermes"
+
+        mgr.sync_back(hermes_home=hermes_home)
+
+        manifests = list((hermes_home / "cache" / "terminal" / "manifests").glob("*.json"))
+        assert len(manifests) == 1
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        assert manifest["owner"] == "file-sync"
+        assert manifest["kind"] == "staging"
+        assert manifest["status"] == "finalized-success"
 
 
 class TestSyncBackAppliesChanged:

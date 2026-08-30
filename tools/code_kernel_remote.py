@@ -180,7 +180,9 @@ def _is_alive(kernel: RemoteKernel) -> bool:
 
 
 def _kill(kernel: RemoteKernel) -> None:
-    """Best-effort kill of the runner and its subprocesses, then rm -rf."""
+    """Best-effort kill of the runner and its subprocesses, then clean its tree."""
+    from tools.code_execution_tool import _env_temp_dir, _remote_cleanup_command
+
     try:
         kernel.env.execute(
             # Kill the runner's process group if the shell gave it one,
@@ -193,7 +195,13 @@ def _kill(kernel: RemoteKernel) -> None:
         logger.debug("remote kernel kill failed (transport?)", exc_info=True)
     try:
         kernel.env.execute(
-            f"rm -rf {shlex.quote(kernel.kernel_dir)}", cwd="/", timeout=15,
+            _remote_cleanup_command(
+                kernel.kernel_dir,
+                _env_temp_dir(kernel.env),
+                prefix="hermes_rkernel_",
+            ),
+            cwd="/",
+            timeout=15,
         )
     except Exception:
         logger.debug("remote kernel dir cleanup failed", exc_info=True)
@@ -230,6 +238,7 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
         MAX_STDOUT_BYTES,
         _ship_file_to_remote,
         _env_temp_dir,
+        _remote_cleanup_command,
         generate_hermes_tools_module,
     )
     import secrets as _secrets
@@ -269,7 +278,15 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
         if not pid.isdigit():
             logger.warning("remote kernel spawn returned no PID: %r",
                            started.get("output", ""))
-            env.execute(f"rm -rf {q_dir}", cwd="/", timeout=15)
+            env.execute(
+                _remote_cleanup_command(
+                    kernel_dir,
+                    _env_temp_dir(env),
+                    prefix="hermes_rkernel_",
+                ),
+                cwd="/",
+                timeout=15,
+            )
             return None
 
         kernel = RemoteKernel(
@@ -285,13 +302,29 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
                                (log.get("output", "") or "")[:500])
             except Exception:
                 pass
-            env.execute(f"rm -rf {q_dir}", cwd="/", timeout=15)
+            env.execute(
+                _remote_cleanup_command(
+                    kernel_dir,
+                    _env_temp_dir(env),
+                    prefix="hermes_rkernel_",
+                ),
+                cwd="/",
+                timeout=15,
+            )
             return None
         return kernel
     except Exception:
         logger.warning("remote kernel spawn failed", exc_info=True)
         try:
-            env.execute(f"rm -rf {q_dir}", cwd="/", timeout=15)
+            env.execute(
+                _remote_cleanup_command(
+                    kernel_dir,
+                    _env_temp_dir(env),
+                    prefix="hermes_rkernel_",
+                ),
+                cwd="/",
+                timeout=15,
+            )
         except Exception:
             pass
         return None

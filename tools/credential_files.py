@@ -416,6 +416,7 @@ _CACHE_DIRS: list[tuple[str, str]] = [
     ("cache/screenshots", "browser_screenshots"),
     ("cache/web", "web_cache"),
     ("cache/delegation", "delegation_cache"),
+    ("cache/terminal/spillover", "cache/terminal/spillover"),
     # Oversized tool results (tools/tool_result_storage.py). Host-side is the
     # single canonical location; mounting/syncing it lets remote backends
     # read spilled results at the translated path instead of needing a

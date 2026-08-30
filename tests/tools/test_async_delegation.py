@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -177,6 +178,36 @@ def test_dispatch_returns_immediately_without_blocking():
     # CI runner can be slow but never anywhere near the runner's 5s gate).
     assert ad.active_count() == 1
     assert elapsed < 4.0, f"dispatch blocked {elapsed:.2f}s (gate is 5s)"
+    gate.set()
+
+
+def test_dispatch_registers_artifact_operation():
+    """Accepted async delegations expose a live artifact operation."""
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    result = ad.dispatch_async_delegation(
+        goal="g",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+        max_async_children=3,
+    )
+
+    assert result["status"] == "dispatched"
+    assert result["artifact_id"]
+    manifest_path = Path(result["artifact_manifest"])
+    assert manifest_path.is_file()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["owner"] == "delegate-task"
+    assert manifest["kind"] == "process"
+    assert manifest["status"] == "active"
     gate.set()
 
 

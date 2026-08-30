@@ -38,12 +38,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -123,6 +125,45 @@ _monitor_stop = threading.Event()
 
 def _db_path():
     return get_hermes_home() / "state.db"
+
+
+def _create_delegation_artifact(delegation_id: str):
+    """Create a lifecycle operation for one delegated execution."""
+    try:
+        from hermes_cli.config import load_config
+        from tools.artifact_lifecycle import ArtifactManager
+
+        return ArtifactManager.from_config(
+            load_config(), session_id=f"delegation-{delegation_id}"
+        ).create_operation(
+            owner="delegate-task",
+            kind="process",
+            sensitivity="sensitive",
+            retention="ttl",
+            retention_seconds=_DURABLE_RETENTION_SECONDS,
+            pid=os.getpid(),
+        )
+    except Exception as exc:
+        logger.debug("Could not create delegation artifact operation: %s", exc)
+        return None
+
+
+def _finalize_delegation_artifact(record: Dict[str, Any], status: str) -> None:
+    """Finalize a delegation artifact manifest after completion delivery."""
+    artifact_id = record.get("artifact_id")
+    manifest_path = record.get("artifact_manifest")
+    if not artifact_id or not manifest_path:
+        return
+    try:
+        from tools.artifact_lifecycle import ArtifactManager
+
+        manifest = Path(manifest_path)
+        manager = ArtifactManager(manifest.parent.parent)
+        operation = manager.load_operation(str(artifact_id))
+        outcome = "success" if status in {"completed", "success"} else "failure"
+        operation.finalize(outcome)
+    except Exception as exc:
+        logger.debug("Could not finalize delegation artifact %s: %s", artifact_id, exc)
 
 
 def _connect() -> sqlite3.Connection:
@@ -252,6 +293,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         key: record.get(key)
         for key in (
             "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+            "artifact_id", "artifact_manifest",
             # Routing origin (scope_id/user_id/user_name): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
@@ -368,6 +410,8 @@ def recover_abandoned_delegations() -> int:
             task = json.loads(task_json or "{}")
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
+                "artifact_id": task.get("artifact_id"),
+                "artifact_manifest": task.get("artifact_manifest"),
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
                 # Restore the durable wake target so completions recovered
                 # after a restart remain routable to api_server sessions.
@@ -861,6 +905,11 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
+    artifact_operation = _create_delegation_artifact(delegation_id)
+    if artifact_operation is not None:
+        record["artifact_id"] = artifact_operation.operation_id
+        record["artifact_manifest"] = str(artifact_operation.manifest_path)
+
     _persist_dispatch(record)
     executor = _get_executor(max_async_children)
 
@@ -890,6 +939,8 @@ def dispatch_async_delegation(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
+        if artifact_operation is not None:
+            artifact_operation.finalize("failure")
         _delete_durable_delegation(delegation_id)
         return {
             "status": "rejected",
@@ -902,7 +953,11 @@ def dispatch_async_delegation(
         "Dispatched async delegation %s (session_key=%s): %s",
         delegation_id, session_key or "<cli>", (goal or "")[:80],
     )
-    return {"status": "dispatched", "delegation_id": delegation_id}
+    response = {"status": "dispatched", "delegation_id": delegation_id}
+    if artifact_operation is not None:
+        response["artifact_id"] = artifact_operation.operation_id
+        response["artifact_manifest"] = str(artifact_operation.manifest_path)
+    return response
 
 
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
@@ -912,6 +967,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
+    _finalize_delegation_artifact(event_record, status)
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
 
@@ -971,6 +1027,8 @@ def _push_completion_event(
     evt = {
         "type": "async_delegation",
         "delegation_id": record.get("delegation_id"),
+        "artifact_id": record.get("artifact_id"),
+        "artifact_manifest": record.get("artifact_manifest"),
         # session_key routes the completion back to the originating gateway
         # session; empty string => CLI (single-session) path.
         "session_key": record.get("session_key", ""),
@@ -1104,6 +1162,11 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
+    artifact_operation = _create_delegation_artifact(delegation_id)
+    if artifact_operation is not None:
+        record["artifact_id"] = artifact_operation.operation_id
+        record["artifact_manifest"] = str(artifact_operation.manifest_path)
+
     _persist_dispatch(record)
     executor = _get_executor(max_async_children)
 
@@ -1138,6 +1201,8 @@ def dispatch_async_delegation_batch(
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
+        if artifact_operation is not None:
+            artifact_operation.finalize("failure")
         _delete_durable_delegation(delegation_id)
         return {
             "status": "rejected",
@@ -1150,7 +1215,11 @@ def dispatch_async_delegation_batch(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
         delegation_id, n, session_key or "<cli>",
     )
-    return {"status": "dispatched", "delegation_id": delegation_id}
+    response = {"status": "dispatched", "delegation_id": delegation_id}
+    if artifact_operation is not None:
+        response["artifact_id"] = artifact_operation.operation_id
+        response["artifact_manifest"] = str(artifact_operation.manifest_path)
+    return response
 
 
 def _finalize_batch(
@@ -1162,6 +1231,7 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
+    _finalize_delegation_artifact(event_record, status)
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
 
@@ -1185,6 +1255,8 @@ def _push_batch_completion_event(
     evt = {
         "type": "async_delegation",
         "delegation_id": event_record.get("delegation_id"),
+        "artifact_id": event_record.get("artifact_id"),
+        "artifact_manifest": event_record.get("artifact_manifest"),
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),

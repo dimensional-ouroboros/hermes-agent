@@ -177,18 +177,16 @@ def _is_protected_cron_path(p: Path) -> bool:
     protected, because deleting it wholesale erases every job's retained run
     history at once.
     """
-    # Lazily build the set once per process so HERMES_HOME is resolved
-    # exactly once.
-    if not _PROTECTED_CRON_PATHS:
-        hermes_home = get_hermes_home()
-        for parent in ("cron", "cronjobs"):
-            base = hermes_home / parent
-            _PROTECTED_CRON_PATHS.add(str(base))
-            _PROTECTED_CRON_PATHS.add(str(base / "output"))
-            _PROTECTED_CRON_PATHS.add(str(base / "jobs.json"))
-            _PROTECTED_CRON_PATHS.add(str(base / ".tick.lock"))
+    hermes_home = get_hermes_home()
+    protected_paths = set()
+    for parent in ("cron", "cronjobs"):
+        base = hermes_home / parent
+        protected_paths.add(str(base))
+        protected_paths.add(str(base / "output"))
+        protected_paths.add(str(base / "jobs.json"))
+        protected_paths.add(str(base / ".tick.lock"))
     resolved = str(p.resolve())
-    return resolved in _PROTECTED_CRON_PATHS
+    return resolved in protected_paths
 
 
 def fmt_size(n: float) -> str:
@@ -321,6 +319,10 @@ def quick() -> Dict[str, Any]:
             _log(f"STALE: {p} (removed from tracking)")
             continue
 
+        if not is_safe_path(p):
+            _log(f"SKIP unsafe tracked path: {p}")
+            continue
+
         age = (now - datetime.fromisoformat(item["timestamp"])).days
 
         # ---- stale-state migration (fixes #37721) ----
@@ -371,7 +373,16 @@ def quick() -> Dict[str, Any]:
                 if p.is_file():
                     p.unlink()
                 elif p.is_dir():
-                    shutil.rmtree(p)
+                    from tools.artifact_lifecycle import remove_owned_tree
+
+                    try:
+                        p.resolve().relative_to(get_hermes_home().resolve())
+                        allowed_root = get_hermes_home()
+                    except ValueError:
+                        allowed_root = p.parent
+                    cleanup = remove_owned_tree(p, allowed_root=allowed_root)
+                    if cleanup["failures"]:
+                        raise OSError("; ".join(cleanup["failures"]))
                 freed += item["size"]
                 deleted += 1
                 _log(f"DELETED: {p} ({cat}, {fmt_size(item['size'])})")

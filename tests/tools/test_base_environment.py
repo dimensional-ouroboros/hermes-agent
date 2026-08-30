@@ -4,7 +4,12 @@ Tests _wrap_command(), _extract_cwd_from_output(), _embed_stdin_heredoc(),
 init_session() failure handling, and the CWD marker contract.
 """
 
+import json
+import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
 
 from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
 
@@ -470,3 +475,42 @@ class TestSanitizeTaskIdForPath:
         )
         target.mkdir(parents=True)
         assert target.is_dir()
+
+
+def test_keyboard_interrupt_finalizes_terminal_spill_operation(tmp_path, monkeypatch):
+    """Close and finalize overflow state when the wait loop is interrupted."""
+    import tools.environments.base as base
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    calls = 0
+
+    def interrupt_after_first_poll():
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise KeyboardInterrupt
+        return False
+
+    monkeypatch.setattr(base, "is_interrupted", interrupt_after_first_poll)
+    process = subprocess.Popen(
+        ["bash", "-c", "python3 -c 'print(\"x\" * 60000); import time; time.sleep(30)'"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    env = _TestableEnv(cwd=str(tmp_path))
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            env._wait_for_process(process, timeout=60, bounded_capture=True)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+
+    manifests = list((tmp_path / ".hermes" / "cache" / "terminal" / "manifests").glob("*.json"))
+    terminal_manifests = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in manifests
+        if json.loads(path.read_text(encoding="utf-8")).get("owner") == "terminal-output"
+    ]
+    assert terminal_manifests
+    assert all(item["status"] != "active" for item in terminal_manifests)

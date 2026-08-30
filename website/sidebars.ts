@@ -761,6 +761,7 @@ const sidebars: SidebarsConfig = {
             'developer-guide/agent-loop',
             'developer-guide/prompt-assembly',
             'developer-guide/context-compression-and-caching',
+            'developer-guide/artifact-lifecycle',
             'developer-guide/gateway-internals',
             'developer-guide/session-storage',
             'developer-guide/provider-runtime',

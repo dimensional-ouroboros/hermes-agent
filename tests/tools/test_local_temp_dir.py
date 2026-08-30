@@ -5,8 +5,10 @@ users on RAM-based tmpfs ``/tmp`` can point session temp files (background
 logs/pid/exit files, code-execution sandboxes) at real storage.
 """
 
+import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -120,6 +122,27 @@ def test_cleanup_terminal_temp_cache(tmp_path, monkeypatch):
     assert live_pid.exists() and live_log.exists()
     assert not stale.exists()
     assert not (root / "hermes_bg_dead1.log").exists()
+
+
+def test_local_environment_cleanup_finalizes_owned_operation(tmp_path, monkeypatch):
+    """Local terminal teardown removes its operation payload and keeps manifest."""
+    root = tmp_path / "cache" / "terminal"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(LocalEnvironment, "init_session", lambda self: None)
+    monkeypatch.setattr(LocalEnvironment, "get_temp_dir", lambda self: str(root))
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=5, env={})
+    operation = env._artifact_operation
+    assert operation is not None
+    assert Path(env._snapshot_path).parent == operation.root
+    assert Path(env._cwd_file).parent == operation.root
+
+    Path(env._snapshot_path).write_text("secret-ish shell state", encoding="utf-8")
+    env.cleanup()
+
+    assert not operation.root.exists()
+    manifest = json.loads(operation.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "finalized-cancelled"
 
 
 if __name__ == "__main__":

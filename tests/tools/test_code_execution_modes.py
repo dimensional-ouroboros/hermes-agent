@@ -254,8 +254,10 @@ class TestExecuteCodeModeIntegration(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         cwd = result["output"].strip()
         self.assertTrue(
-            "hermes_sandbox_" in cwd or "hermes_kernel_" in cwd,
-            f"strict-mode cwd is not a staging tmpdir: {cwd!r}",
+            "hermes_sandbox_" in cwd
+            or "hermes_kernel_" in cwd
+            or "/cache/terminal/operations/" in cwd,
+            f"strict-mode cwd is not a managed staging directory: {cwd!r}",
         )
         self.assertNotEqual(os.path.realpath(cwd), os.path.realpath(os.getcwd()))
 

@@ -2680,14 +2680,22 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
         f"for the chat.]\n\n{content}"
     )
 
-    query_file = None
+    from hermes_cli.config import load_config
+    from tools.artifact_lifecycle import ArtifactManager
+
+    operation = ArtifactManager.from_config(
+        load_config(), session_id=f"cron-botchat-{uuid.uuid4().hex[:12]}"
+    ).create_operation(
+        owner="cron-botchat",
+        kind="staging",
+        sensitivity="sensitive",
+        retention="finalize",
+    )
+    outcome = "failure"
     try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", suffix=".txt", prefix="hermes-cron-botchat-",
-            delete=False,
-        ) as fh:
-            fh.write(message)
-            query_file = fh.name
+        query_path = operation.path("query.txt")
+        query_path.write_text(message, encoding="utf-8")
+        query_file = str(query_path)
 
         argv += [
             "chat", "--in", "~", "-c", "Bot Chat", "--create-if-missing",
@@ -2702,6 +2710,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
             env=env,
             creationflags=windows_hide_flags(),
         )
+        outcome = "success"
         if result.returncode != 0:
             tail = (result.stderr or result.stdout or "").strip()[-500:]
             msg = (
@@ -2730,11 +2739,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
         logger.warning("Job '%s': %s", job_id, msg, exc_info=True)
         return msg
     finally:
-        if query_file:
-            try:
-                os.unlink(query_file)
-            except OSError:
-                pass
+        operation.finalize(outcome)
 
 
 def _normalize_deliver_value(deliver) -> str:

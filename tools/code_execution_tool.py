@@ -578,8 +578,9 @@ def _connect():
     """Connect to the parent's RPC server via the transport it picked.
 
     HERMES_RPC_SOCKET can be either:
-      - a filesystem path (POSIX Unix domain socket — the default on
-        Linux and macOS)
+      - a filesystem path (POSIX Unix domain socket)
+      - ``abstract://<name>`` (Linux/macOS abstract Unix socket with no
+        filesystem pathname)
       - a string of the form ``tcp://127.0.0.1:<port>`` (Windows, where
         AF_UNIX is unreliable — the parent falls back to loopback TCP)
     """
@@ -593,6 +594,9 @@ def _connect():
             _host, _, _port = _host_port.rpartition(":")
             _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             _sock.connect((_host or "127.0.0.1", int(_port)))
+        elif endpoint.startswith("abstract://"):
+            _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            _sock.connect("\\0" + endpoint[len("abstract://"):])
         else:
             _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             _sock.connect(endpoint)
@@ -1001,6 +1005,41 @@ def _env_temp_dir(env: Any) -> str:
     return "/tmp"
 
 
+_REMOTE_CLEANUP_SCRIPT = """\
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+parent = os.path.realpath(sys.argv[2])
+prefix = sys.argv[3]
+if os.path.dirname(root) != parent or not os.path.basename(root).startswith(prefix):
+    raise SystemExit(2)
+for directory, names, files in os.walk(root, topdown=False, followlinks=False):
+    for name in files:
+        os.unlink(os.path.join(directory, name))
+    for name in names:
+        path = os.path.join(directory, name)
+        if os.path.islink(path):
+            os.unlink(path)
+        else:
+            os.rmdir(path)
+os.rmdir(root)
+"""
+
+
+def _remote_cleanup_command(
+    sandbox_dir: str,
+    temp_dir: str,
+    *,
+    prefix: str = "hermes_exec_",
+) -> str:
+    """Build a bounded cleanup command for one remote execute sandbox."""
+    return (
+        f"python3 -c {shlex.quote(_REMOTE_CLEANUP_SCRIPT)} -- "
+        f"{shlex.quote(sandbox_dir)} {shlex.quote(temp_dir)} {shlex.quote(prefix)}"
+    )
+
+
 def _rpc_poll_loop(
     env,
     rpc_dir: str,
@@ -1379,7 +1418,7 @@ def _execute_remote(
         # Clean up remote sandbox dir
         try:
             env.execute(
-                f"rm -rf {quoted_sandbox_dir}", cwd="/", timeout=15,
+                _remote_cleanup_command(sandbox_dir, temp_dir), cwd="/", timeout=15,
             )
         except Exception:
             logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
@@ -1651,8 +1690,21 @@ def execute_code(
             is_interrupted=_is_interrupted,
         )
 
-    # --- Set up temp directory with hermes_tools.py and script.py ---
-    tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
+    # --- Set up an owned staging directory with hermes_tools.py and script.py ---
+    from hermes_cli.config import load_config
+    from tools.artifact_lifecycle import ArtifactManager
+
+    artifact_operation = ArtifactManager.from_config(
+        load_config(), session_id=f"execute-{uuid.uuid4().hex[:12]}"
+    ).create_operation(
+        owner="execute-code",
+        kind="staging",
+        sensitivity="sensitive",
+        retention="finalize",
+        pid=os.getpid(),
+    )
+    tmpdir = str(artifact_operation.root)
+    outcome = "failure"
     # Use /tmp on macOS to avoid the long /var/folders/... path that pushes
     # Unix domain socket paths past the 104-byte macOS AF_UNIX limit.
     # On Linux, tempfile.gettempdir() already returns /tmp.
@@ -1759,6 +1811,9 @@ def execute_code(
             tmpdir=tmpdir,
             child_python=_child_python,
         )
+        child_env["HERMES_ARTIFACT_ROOT"] = tmpdir
+        child_env["HERMES_OPERATION_ID"] = artifact_operation.operation_id
+        child_env["HERMES_RPC_DIR"] = os.path.join(tmpdir, "rpc")
 
         proc = subprocess.Popen(
             [_child_python, _script_path],
@@ -1956,6 +2011,7 @@ def execute_code(
             if hint:
                 result["hint"] = hint
 
+        outcome = "success"
         return json.dumps(result, ensure_ascii=False)
 
     except Exception as exc:
@@ -1976,14 +2032,16 @@ def execute_code(
         }, ensure_ascii=False)
 
     finally:
-        # Cleanup temp dir and socket
+        # Finalize the owned staging operation and clean up the socket.
         if server_sock is not None:
             try:
                 server_sock.close()
             except OSError as e:
                 logger.debug("Server socket close error: %s", e)
-        import shutil
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            artifact_operation.finalize(outcome)
+        except Exception:
+            logger.debug("Failed to finalize execute-code artifacts", exc_info=True)
         try:
             # Only UDS has a filesystem socket to unlink; TCP sockets are
             # freed by server_sock.close() above.

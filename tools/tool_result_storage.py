@@ -12,7 +12,7 @@ Defense against context-window overflow operates at three levels:
    in-context content is replaced with a preview + file path reference.
 
    The canonical home is ALWAYS host-side:
-   ``$HERMES_HOME/cache/spillover/{tool_use_id}.txt`` — alongside the other
+   ``$HERMES_HOME/cache/terminal/spillover/{tool_use_id}.txt`` — alongside the other
    Hermes-owned caches (images, audio, documents, ...) instead of littering
    the OS temp dir. This needs no sandbox environment, so it also works for
    sessions that never ran a terminal command (MCP-only, cron, gateway) —
@@ -23,7 +23,7 @@ Defense against context-window overflow operates at three levels:
    What the model sees depends on the backend:
 
    - **Local backend (or no active env):** the host path itself.
-   - **Remote backends (docker/ssh/modal/daytona):** ``cache/spillover`` is
+   - **Remote backends (docker/ssh/modal/daytona):** ``cache/terminal/spillover`` is
      in the auto-mounted/synced cache-dir list (tools/credential_files.py),
      so the reference is the translated in-sandbox path (probed for
      readability first). When the sandbox can't see it (e.g. a persistent
@@ -43,6 +43,7 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -50,6 +51,7 @@ import shlex
 import threading
 import time
 import uuid
+from pathlib import Path
 
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -61,7 +63,7 @@ logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
 PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 STORAGE_DIR = "/tmp/hermes-results"
-SPILLOVER_SUBDIR = "cache/spillover"
+SPILLOVER_SUBDIR = "cache/terminal/spillover"
 SPILLOVER_MAX_AGE_HOURS = 24
 HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
@@ -73,10 +75,25 @@ _spillover_pruned_once = False
 
 
 def get_spillover_dir():
-    """Return $HERMES_HOME/cache/spillover as a Path (not created)."""
-    from hermes_constants import get_hermes_home
+    """Return the manager-owned spillover namespace without creating it."""
+    return _get_artifact_manager().root / "spillover"
 
-    return get_hermes_home() / SPILLOVER_SUBDIR
+
+def _get_artifact_manager():
+    """Create a manager for the active Hermes profile and session."""
+    from tools.artifact_lifecycle import ArtifactManager
+
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    except Exception:
+        config = {}
+    session_id = os.environ.get("HERMES_SESSION_ID") or "default"
+    try:
+        return ArtifactManager.from_config(config, session_id=session_id)
+    except ValueError:
+        return ArtifactManager.from_config(config, session_id="default")
 
 
 def cleanup_spillover_cache(max_age_hours: int = SPILLOVER_MAX_AGE_HOURS) -> int:
@@ -87,15 +104,33 @@ def cleanup_spillover_cache(max_age_hours: int = SPILLOVER_MAX_AGE_HOURS) -> int
     so the gateway housekeeping loop can prune this dir on the same
     hourly cadence as the media caches.
     """
+    manager = _get_artifact_manager()
+    try:
+        manager.reap_orphans(dry_run=False)
+    except Exception as exc:
+        logger.debug("Managed spillover prune failed: %s", exc)
+
     cutoff = time.time() - (max_age_hours * 3600)
     removed = 0
+    protected: set[str] = set()
+    try:
+        for manifest_path in manager.manifests_root.glob("*.json"):
+            metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if metadata.get("status") != "active":
+                continue
+            if metadata.get("shared_payload_root"):
+                payload_root = Path(metadata.get("payload_root", ""))
+                if payload_root == get_spillover_dir():
+                    protected.update(str(payload_root / rel) for rel in metadata.get("relative_paths", []))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
     try:
         entries = list(get_spillover_dir().iterdir())
     except OSError:
         return 0
     for f in entries:
         try:
-            if f.is_file() and f.stat().st_mtime < cutoff:
+            if str(f) not in protected and f.is_file() and f.stat().st_mtime < cutoff:
                 f.unlink()
                 removed += 1
         except OSError:
@@ -143,16 +178,28 @@ def _is_host_side_env(env) -> bool:
 
 
 def _write_to_spillover(content: str, filename: str):
-    """Write content host-side to $HERMES_HOME/cache/spillover.
+    """Write content host-side to the managed spillover namespace.
 
     Returns the absolute path string on success, None on failure.
     """
+    operation = None
     try:
+        manager = _get_artifact_manager()
         spill_dir = get_spillover_dir()
         spill_dir.mkdir(parents=True, exist_ok=True)
-        path = spill_dir / filename
+        operation = manager.create_operation(
+            owner="tool-result-storage",
+            kind="spillover",
+            sensitivity="sensitive",
+            retention="ttl",
+            retention_seconds=SPILLOVER_MAX_AGE_HOURS * 3600,
+            pid=os.getpid(),
+            payload_root=spill_dir,
+        )
+        path = operation.path(filename)
         path.write_text(content, encoding="utf-8", errors="replace")
-    except OSError as exc:
+        operation.register_existing(path)
+    except Exception as exc:
         logger.warning("Spillover write failed for %s: %s", filename, exc)
         return None
     _prune_spillover_once()
@@ -162,7 +209,7 @@ def _write_to_spillover(content: str, filename: str):
 def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
     """Return the path where a remote backend can read *host_path*, or None.
 
-    ``cache/spillover`` is one of the auto-mounted/synced cache dirs
+    ``cache/terminal/spillover`` is one of the auto-mounted/synced cache dirs
     (tools/credential_files.py), so on docker it is bind-mounted and on
     modal/ssh/daytona it is file-synced into the sandbox. Translate the
     host path with the same helper the image tools use, force a sync for
@@ -347,7 +394,7 @@ def maybe_persist_tool_result(
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
 
-    # Always persist host-side first: $HERMES_HOME/cache/spillover is the
+    # Always persist host-side first: $HERMES_HOME/cache/terminal/spillover is the
     # single canonical home for spilled results (with the other Hermes-owned
     # caches, pruned by gateway housekeeping) regardless of backend.
     host_path = _write_to_spillover(content, filename)

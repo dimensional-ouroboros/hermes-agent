@@ -70,6 +70,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes debug` | Debug tools — upload logs and system info for support. |
 | `hermes backup` | Back up Hermes home directory to a zip file. |
 | `hermes checkpoints` | Inspect / prune / clear `~/.hermes/checkpoints/` (the shadow store used by `/rollback`). Run with no args for a status overview. |
+| `hermes artifacts` | Inspect managed temporary artifacts and durable/external retention state; preview or explicitly reap expired dead-owner operations, list manifests, and promote one output. |
 | `hermes import` | Restore a Hermes backup from a zip file. |
 | `hermes logs` | View, tail, and filter agent/gateway/error log files. |
 | `hermes config` | Show, edit, migrate, and query configuration files. |

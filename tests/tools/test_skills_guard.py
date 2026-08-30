@@ -32,6 +32,7 @@ from tools.skills_guard import (
     _check_structure,
     _unicode_char_name,
     _load_skill_ignore,
+    scan_artifact_policy,
     MAX_FILE_COUNT,
     MAX_SINGLE_FILE_KB,
 )
@@ -235,6 +236,155 @@ class TestScanSkill:
 
         result = scan_skill(f, source="community")
         assert result.verdict != "safe"
+
+
+class TestArtifactPolicy:
+    def test_detects_unmanaged_executable_artifact_guidance(self, tmp_path):
+        """Detect raw temp/worktree creation in executable skill guidance."""
+        skill = tmp_path / "artifact-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """# Artifact skill
+
+```bash
+WORKTREE=$(mktemp -d)
+git worktree add /tmp/issue-123 main
+rm -rf "$WORKTREE"
+```
+""",
+            encoding="utf-8",
+        )
+
+        findings = scan_artifact_policy(skill)
+        ids = {finding.pattern_id for finding in findings}
+        assert {"artifact_mktemp", "artifact_tmp_path", "artifact_recursive_delete"} <= ids
+
+    def test_ignores_explicitly_rejected_legacy_example(self, tmp_path):
+        """Ignore raw paths that are explicitly labelled as rejected guidance."""
+        skill = tmp_path / "legacy-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """# Legacy examples
+
+Rejected legacy example; do not run:
+
+```bash
+rm -rf /tmp/old-scratch
+```
+""",
+            encoding="utf-8",
+        )
+
+        assert scan_artifact_policy(skill) == []
+
+    def test_accepts_manager_owned_guidance(self, tmp_path):
+        """Accept artifact instructions that use Hermes-managed operations."""
+        skill = tmp_path / "managed-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """# Managed examples
+
+```bash
+hermes artifact create --kind staging
+report="$HERMES_OPERATION_DIR/report.md"
+```
+""",
+            encoding="utf-8",
+        )
+
+        assert scan_artifact_policy(skill) == []
+
+    def test_scan_skill_blocks_unmanaged_artifact_policy(self, tmp_path):
+        """Block installation when executable guidance bypasses the manager."""
+        skill = tmp_path / "blocked-artifact-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """# Unmanaged
+
+```bash
+WORKTREE=$(mktemp -d)
+rm -rf "$WORKTREE"
+```
+""",
+            encoding="utf-8",
+        )
+
+        result = scan_skill(skill, source="community")
+        allowed, reason = should_allow_install(result)
+
+        assert len(result.policy_findings) == 2
+        assert allowed is False
+        assert "artifact policy" in reason.lower()
+
+    def test_scan_skill_requires_policy_for_programmatic_writers(self, tmp_path):
+        """Require lifecycle metadata when a skill writes files in Python."""
+        skill = tmp_path / "writer-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """# Writer
+
+```python
+Path("report.txt").write_text("report", encoding="utf-8")
+```
+""",
+            encoding="utf-8",
+        )
+
+        result = scan_skill(skill, source="community")
+
+        assert [finding.pattern_id for finding in result.policy_findings] == [
+            "artifact_policy_missing"
+        ]
+        assert should_allow_install(result)[0] is False
+
+    def test_scan_skill_accepts_valid_policy_for_programmatic_writers(self, tmp_path):
+        """Accept programmatic writers that declare managed artifact policy."""
+        skill = tmp_path / "declared-writer-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """---
+name: declared-writer
+artifact_policy:
+  kinds: [staging]
+  cleanup: finalize
+  persistent_outputs: explicit-promotion
+  external_state: preserve
+---
+# Writer
+
+```python
+Path("report.txt").write_text("report", encoding="utf-8")
+```
+""",
+            encoding="utf-8",
+        )
+
+        result = scan_skill(skill, source="community")
+
+        assert result.policy_findings == []
+        assert result.artifact_policy["cleanup"] == "finalize"
+
+    def test_detects_common_programmatic_file_writers(self, tmp_path):
+        """Detect open, replace, and copy APIs that bypass lifecycle metadata."""
+        skill = tmp_path / "api-writer-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """# Writers
+
+```python
+open("report.txt", "w", encoding="utf-8")
+os.replace("a", "b")
+shutil.copy2("a", "b")
+```
+""",
+            encoding="utf-8",
+        )
+
+        findings = scan_artifact_policy(skill)
+
+        assert {finding.pattern_id for finding in findings} == {
+            "artifact_file_writer"
+        }
 
 
 # ---------------------------------------------------------------------------

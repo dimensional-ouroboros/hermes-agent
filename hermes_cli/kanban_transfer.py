@@ -46,8 +46,9 @@ import contextlib
 import json
 import shutil
 import sqlite3
-import tempfile
+import tarfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -175,8 +176,20 @@ def export_board(
     base = str(output).removesuffix(".tar.gz").removesuffix(".tgz")
     Path(base).parent.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        staged = Path(tmpdir) / slug
+    from hermes_cli.config import load_config
+    from tools.artifact_lifecycle import ArtifactManager
+
+    operation = ArtifactManager.from_config(
+        load_config(), session_id=f"kanban-export-{uuid.uuid4().hex[:12]}"
+    ).create_operation(
+        owner="kanban-transfer",
+        kind="staging",
+        sensitivity="sensitive",
+        retention="finalize",
+    )
+    outcome = "failure"
+    try:
+        staged = operation.path(slug)
         staged.mkdir(parents=True)
 
         _snapshot_db(db_path, staged / "kanban.db")
@@ -226,14 +239,17 @@ def export_board(
         }
         _write_json(staged / "manifest.json", manifest)
 
-        archive = make_targz(base, tmpdir, slug)
+        archive = make_targz(base, operation.root, slug)
 
-    return {
-        "board": slug,
-        "archive": archive,
-        "size": Path(archive).stat().st_size,
-        "counts": manifest["counts"],
-    }
+        outcome = "success"
+        return {
+            "board": slug,
+            "archive": archive,
+            "size": Path(archive).stat().st_size,
+            "counts": manifest["counts"],
+        }
+    finally:
+        operation.finalize(outcome)
 
 
 # ---------------------------------------------------------------------------
@@ -406,8 +422,20 @@ def import_board(
         )
     archive_root = roots.pop()
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        staging = Path(tmpdir)
+    from hermes_cli.config import load_config
+    from tools.artifact_lifecycle import ArtifactManager
+
+    operation = ArtifactManager.from_config(
+        load_config(), session_id=f"kanban-import-{uuid.uuid4().hex[:12]}"
+    ).create_operation(
+        owner="kanban-transfer",
+        kind="staging",
+        sensitivity="sensitive",
+        retention="finalize",
+    )
+    outcome = "failure"
+    try:
+        staging = operation.root
         safe_extract_targz(archive, staging)
         extracted = staging / archive_root
 
@@ -435,6 +463,9 @@ def import_board(
             src = extracted / tree
             if src.is_dir():
                 shutil.move(str(src), str(board_root / tree))
+        outcome = "success"
+    finally:
+        operation.finalize(outcome)
 
     # Rewritten rather than moved across: the archive's copy names a slug
     # and a workdir that belong to the exporting machine.

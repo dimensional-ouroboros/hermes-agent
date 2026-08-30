@@ -656,6 +656,16 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Lifecycle policy for Hermes-owned temporary artifacts. Durable state such
+    # as sessions, checkpoints, backups, logs, and memories has its own policy.
+    "artifact_lifecycle": {
+        "enabled": True,
+        "orphan_grace_hours": 24,
+        "spillover_retention_hours": 24,
+        "scratch_retention_hours": 0,
+        "max_total_size_mb": 2048,
+    },
+
     # Filesystem checkpoints — automatic snapshots before destructive file ops.
     # When enabled, the agent takes a snapshot of the working directory once
     # per conversation turn (on first write_file/patch call).  Use /rollback

@@ -145,6 +145,25 @@ def create_subagent_worktree(
 
     _ensure_gitignore_entry(repo_root)
 
+    artifact_operation = None
+    try:
+        from hermes_cli.config import load_config
+        from tools.artifact_lifecycle import ArtifactManager
+
+        artifact_operation = ArtifactManager.from_config(
+            load_config(), session_id=f"worktree-{uuid.uuid4().hex[:12]}"
+        ).create_operation(
+            owner="subagent-worktree",
+            kind="worktree",
+            sensitivity="internal",
+            retention="manual",
+            pid=os.getpid(),
+            payload_root=wt_path.parent,
+        )
+    except Exception as exc:
+        logger.warning("subagent worktree: artifact registration failed: %s", exc)
+        return None
+
     try:
         base = _run_git(["rev-parse", "HEAD"], cwd=repo_root)
         base_commit = base.stdout.strip() if base.returncode == 0 else ""
@@ -154,6 +173,7 @@ def create_subagent_worktree(
         )
     except Exception as exc:
         logger.warning("subagent worktree: creation failed: %s", exc)
+        artifact_operation.finalize("failure")
         return None
     if result.returncode != 0:
         # Common on repos with zero commits (unborn HEAD) — degrade silently.
@@ -161,6 +181,22 @@ def create_subagent_worktree(
             "subagent worktree: git worktree add failed: %s",
             result.stderr.strip(),
         )
+        artifact_operation.finalize("failure")
+        return None
+
+    try:
+        artifact_operation.register_existing(wt_path)
+        artifact_operation.annotate(
+            repo_root=repo_root,
+            branch=branch,
+            base_commit=base_commit,
+            worktree_path=str(wt_path),
+        )
+    except Exception as exc:
+        logger.warning("subagent worktree: artifact registration failed: %s", exc)
+        artifact_operation.finalize("failure")
+        _run_git(["worktree", "remove", "--force", str(wt_path)], cwd=repo_root)
+        _run_git(["branch", "-D", branch], cwd=repo_root)
         return None
 
     logger.info("subagent worktree created: %s (branch %s)", wt_path, branch)
@@ -169,6 +205,8 @@ def create_subagent_worktree(
         "branch": branch,
         "repo_root": repo_root,
         "base_commit": base_commit,
+        "artifact_id": artifact_operation.operation_id,
+        "artifact_manifest": str(artifact_operation.manifest_path),
     }
 
 
@@ -253,6 +291,20 @@ def finalize_subagent_worktree(
     repo_root = info.get("repo_root", "")
     base_commit = info.get("base_commit", "")
 
+    artifact_manager = None
+    artifact_operation = None
+    artifact_manifest = info.get("artifact_manifest", "")
+    artifact_id = info.get("artifact_id", "")
+    if artifact_manifest and artifact_id:
+        try:
+            from tools.artifact_lifecycle import ArtifactManager
+
+            manifest_path = Path(artifact_manifest)
+            artifact_manager = ArtifactManager(manifest_path.parent.parent)
+            artifact_operation = artifact_manager.load_operation(artifact_id)
+        except Exception as exc:
+            logger.debug("subagent worktree: artifact manifest load failed: %s", exc)
+
     payload: Dict[str, Any] = {
         "path": path,
         "branch": branch,
@@ -262,6 +314,8 @@ def finalize_subagent_worktree(
     }
     if not path or not os.path.isdir(path):
         payload["pruned"] = True  # nothing on disk to review
+        if artifact_manager is not None and artifact_operation is not None:
+            artifact_manager.mark_finalized(artifact_operation, "missing")
         return payload
 
     def _unproven(
@@ -276,6 +330,8 @@ def finalize_subagent_worktree(
     # commit that value is an unproven default, exactly the class of bug
     # #88113 is about.
     if not base_commit:
+        if artifact_manager is not None and artifact_operation is not None:
+            artifact_manager.mark_retained(artifact_operation, "inspection-failed")
         return _unproven(
             "no base_commit recorded — commit count unmeasurable",
             unmeasured="commits",
@@ -314,6 +370,8 @@ def finalize_subagent_worktree(
     if failed:
         # Fail-safe (#88113): a destructive cleanup requires affirmative proof
         # of "zero commits + clean tree"; the defaults prove nothing.
+        if artifact_manager is not None and artifact_operation is not None:
+            artifact_manager.mark_retained(artifact_operation, "inspection-failed")
         return _unproven(
             "; ".join(failed), unmeasured="/".join(unmeasured)
         )
@@ -326,6 +384,8 @@ def finalize_subagent_worktree(
             if removed.returncode == 0:
                 _run_git(["branch", "-D", branch], cwd=repo_root or path)
                 payload["pruned"] = True
+                if artifact_manager is not None and artifact_operation is not None:
+                    artifact_manager.mark_finalized(artifact_operation, "pruned")
                 logger.info("subagent worktree pruned (no work): %s", path)
             else:
                 logger.debug(
@@ -333,6 +393,9 @@ def finalize_subagent_worktree(
                 )
         except Exception as exc:
             logger.debug("subagent worktree: prune failed: %s", exc)
+
+    if not payload["pruned"] and artifact_manager is not None and artifact_operation is not None:
+        artifact_manager.mark_retained(artifact_operation, "worktree-preserved")
 
     return payload
 

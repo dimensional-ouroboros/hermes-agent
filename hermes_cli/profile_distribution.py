@@ -64,7 +64,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
-import tempfile
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -675,8 +675,20 @@ def install_distribution(
         create_wrapper_script,
     )
 
-    with tempfile.TemporaryDirectory(prefix="hermes_dist_install_") as tmp:
-        plan = plan_install(source, Path(tmp), override_name=name)
+    from hermes_cli.config import load_config
+    from tools.artifact_lifecycle import ArtifactManager
+
+    operation = ArtifactManager.from_config(
+        load_config(), session_id=f"profile-install-{uuid.uuid4().hex[:12]}"
+    ).create_operation(
+        owner="profile-distribution",
+        kind="staging",
+        sensitivity="sensitive",
+        retention="finalize",
+    )
+    outcome = "failure"
+    try:
+        plan = plan_install(source, operation.root, override_name=name)
 
         if plan.existing and not force:
             raise DistributionError(
@@ -699,7 +711,10 @@ def install_distribution(
             if collision is None:
                 create_wrapper_script(plan.manifest.name)
 
+        outcome = "success"
         return plan
+    finally:
+        operation.finalize(outcome)
 
 
 def update_distribution(
@@ -737,10 +752,22 @@ def update_distribution(
             "`hermes profile install <source> --name {canon} --force`."
         )
 
-    with tempfile.TemporaryDirectory(prefix="hermes_dist_update_") as tmp:
+    from hermes_cli.config import load_config
+    from tools.artifact_lifecycle import ArtifactManager
+
+    operation = ArtifactManager.from_config(
+        load_config(), session_id=f"profile-update-{uuid.uuid4().hex[:12]}"
+    ).create_operation(
+        owner="profile-distribution",
+        kind="staging",
+        sensitivity="sensitive",
+        retention="finalize",
+    )
+    outcome = "failure"
+    try:
         plan = plan_install(
             existing_manifest.source,
-            Path(tmp),
+            operation.root,
             override_name=canon,
         )
         plan.preserves_config = not force_config
@@ -751,7 +778,10 @@ def update_distribution(
             plan.manifest,
             preserve_config=plan.preserves_config,
         )
+        outcome = "success"
         return plan
+    finally:
+        operation.finalize(outcome)
 
 
 # ---------------------------------------------------------------------------

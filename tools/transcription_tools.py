@@ -38,6 +38,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -932,9 +933,16 @@ def _transcribe_command_stt(
     )
     model = model_override or config.get("model") or ""
 
+    from tools.artifact_lifecycle import managed_artifact_operation
+
     try:
-        with tempfile.TemporaryDirectory(prefix=f"hermes-cmd-stt-{provider_name}-") as tmpdir:
-            output_path = Path(tmpdir) / f"transcript.{output_format}"
+        with managed_artifact_operation(
+            owner="transcription-command",
+            kind="staging",
+            sensitivity="sensitive",
+        ) as operation:
+            tmpdir = operation.root
+            output_path = tmpdir / f"transcript.{output_format}"
             placeholders = {
                 "input_path": str(audio.resolve()),
                 "output_path": str(output_path),
@@ -1561,7 +1569,7 @@ def _validate_audio_file(
 
 def _prepare_audio_for_transcription(
     file_path: str,
-) -> tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+) -> tuple[Optional[str], Optional[Any], Optional[Dict[str, Any]]]:
     """Convert a decoder-safe .silk source to a temporary supported WAV file."""
     audio_path = Path(file_path)
     if audio_path.suffix.lower() != ".silk":
@@ -1581,17 +1589,26 @@ def _prepare_audio_for_transcription(
                 "error": "Unsupported format: .silk. Install the optional 'pilk' dependency to enable WeChat voice transcription.",
             }
 
-    temp_dir = tempfile.mkdtemp(prefix="hermes-silk-")
-    converted_path = os.path.join(temp_dir, f"{audio_path.stem}.wav")
+    from tools.artifact_lifecycle import ArtifactManager
+
+    operation = ArtifactManager.from_config(
+        _load_stt_config(), session_id=f"stt-silk-{uuid.uuid4().hex[:12]}"
+    ).create_operation(
+        owner="transcription-silk",
+        kind="staging",
+        sensitivity="sensitive",
+        retention="finalize",
+    )
+    converted_path = operation.path(f"{audio_path.stem}.wav")
     try:
         import pilk
 
-        pilk.silk_to_wav(file_path, converted_path)
-        if not Path(converted_path).is_file() or Path(converted_path).stat().st_size == 0:
+        pilk.silk_to_wav(file_path, str(converted_path))
+        if not converted_path.is_file() or converted_path.stat().st_size == 0:
             raise RuntimeError("pilk did not produce a readable WAV file")
-        return converted_path, temp_dir, None
+        return str(converted_path), operation, None
     except Exception as exc:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        operation.finalize("failure")
         logger.error("Failed to convert .silk audio %s: %s", file_path, exc, exc_info=True)
         return None, None, {
             "success": False,
@@ -3222,7 +3239,7 @@ def transcribe_audio(
     if source_error:
         return source_error
 
-    prepared_path, cleanup_dir, prep_error = _prepare_audio_for_transcription(file_path)
+    prepared_path, cleanup_operation, prep_error = _prepare_audio_for_transcription(file_path)
     if prep_error:
         return prep_error
     if prepared_path is None:
@@ -3238,8 +3255,8 @@ def transcribe_audio(
             return prepared_error
         return _transcribe_prepared_audio(prepared_path, model, source)
     finally:
-        if cleanup_dir:
-            shutil.rmtree(cleanup_dir, ignore_errors=True)
+        if cleanup_operation:
+            cleanup_operation.finalize("success")
 
 
 def _is_local_or_private_url(url: str) -> bool:

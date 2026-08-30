@@ -35,6 +35,27 @@ class TestTruncationSpill:
         assert "row_100 " in full
         assert "read_file" in r["truncation_note"]
 
+    def test_truncated_output_is_registered_in_artifact_lifecycle(self, small_cap):
+        """Register terminal overflow in the managed spillover namespace."""
+        r = json.loads(terminal_tool(
+            "python3 -c \"[print('x'*90) for _ in range(200)]\"",
+            task_id="t-spill-managed",
+        ))
+
+        spill = Path(r["full_output_path"])
+        assert spill.is_relative_to(small_cap / ".hermes" / "cache" / "terminal" / "spillover")
+        manifests = list(
+            (small_cap / ".hermes" / "cache" / "terminal" / "manifests").glob("*.json")
+        )
+        terminal_manifests = []
+        for path in manifests:
+            metadata = json.loads(path.read_text(encoding="utf-8"))
+            if metadata.get("owner") == "terminal-output":
+                terminal_manifests.append(metadata)
+        assert len(terminal_manifests) == 1
+        assert terminal_manifests[0]["kind"] == "spillover"
+        assert terminal_manifests[0]["cleanup_policy"] == "ttl"
+
     def test_small_output_has_no_metadata(self, small_cap):
         r = json.loads(terminal_tool("echo tiny", task_id="t-spill-2"))
         assert r["exit_code"] == 0
